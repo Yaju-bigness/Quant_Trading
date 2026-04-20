@@ -240,14 +240,7 @@ class BacktestEngine:
                      end_date: str,
                      data: pd.DataFrame = None) -> Dict:
         """
-        运行回测
-        :param strategy: 策略实例
-        :param stock_code: 股票代码
-        :param stock_name: 股票名称
-        :param start_date: 开始日期
-        :param end_date: 结束日期
-        :param data: 可选的数据DataFrame（如果不提供则自动获取）
-        :return: 回测结果
+        运行回测（优化版：信号索引查找提升速度）
         """
         self.reset()
 
@@ -262,14 +255,23 @@ class BacktestEngine:
         # 生成信号
         signals = strategy.generate_signals(data)
 
-        # 将信号按日期分组
+        # 将信号按日期索引（优化：O(1)查找替代O(n)遍历）
         signal_dict = {}
         for sig in signals:
-            # 找到最近的日期
-            sig_date = data[data['close'] == sig.price]['date'].iloc[0]
-            if sig_date not in signal_dict:
-                signal_dict[sig_date] = []
-            signal_dict[sig_date].append(sig)
+            # 根据价格和日期匹配
+            mask = data['close'] == sig.price
+            if mask.any():
+                sig_date = data.loc[mask.index[0], 'date'] if mask.any() else None
+                # 尝试更精确的匹配：找最后一个匹配日期
+                matched = data[mask]
+                if not matched.empty:
+                    sig_date = matched['date'].iloc[0]
+                    if sig_date not in signal_dict:
+                        signal_dict[sig_date] = []
+                    signal_dict[sig_date].append(sig)
+
+        # 预构建日期索引集合，加速查找
+        date_set = set(data['date'].tolist())
 
         # 遍历每个交易日
         for idx, row in data.iterrows():
@@ -292,20 +294,15 @@ class BacktestEngine:
             if date in signal_dict:
                 for sig in signal_dict[date]:
                     if sig.signal == Signal.BUY:
-                        # 计算买入数量
                         quantity = strategy.calculate_position(
-                            self.portfolio.cash,
-                            sig.price,
-                            sig
+                            self.portfolio.cash, sig.price, sig
                         )
                         if quantity > 0:
                             self._execute_trade(
                                 date, stock_code, stock_name,
                                 'buy', sig.price, quantity, sig.reason
                             )
-
                     elif sig.signal == Signal.SELL:
-                        # 卖出持仓
                         if stock_code in self.portfolio.positions:
                             pos = self.portfolio.positions[stock_code]
                             if pos.quantity > 0:
@@ -318,6 +315,130 @@ class BacktestEngine:
         self._calculate_daily_returns()
 
         return self._generate_report(stock_code, stock_name)
+
+    def run_portfolio_backtest(self,
+                                strategies: Dict[str, BaseStrategy],
+                                stock_list: Dict[str, str],
+                                start_date: str,
+                                end_date: str) -> Dict:
+        """
+        多标的组合回测：每只股票独立生成信号，共享资金池
+        :param strategies: {stock_code: strategy} 每只股票对应的策略
+        :param stock_list: {name: code} 股票列表
+        :param start_date: 开始日期
+        :param end_date: 结束日期
+        :return: 组合回测报告
+        """
+        self.reset()
+        all_signals = {}  # {date: [(stock_code, signal)]}
+
+        # 为每只股票获取数据并生成信号
+        for name, code in stock_list.items():
+            strategy = strategies.get(code, list(strategies.values())[0]) if strategies else None
+            if strategy is None:
+                continue
+
+            data = self.data_source.get_daily_kline(code, start_date, end_date)
+            if data.empty:
+                continue
+
+            signals = strategy.generate_signals(data)
+            for sig in signals:
+                mask = data['close'] == sig.price
+                if mask.any():
+                    sig_date = data.loc[mask.index[0], 'date']
+                    if sig_date not in all_signals:
+                        all_signals[sig_date] = []
+                    all_signals[sig_date].append((code, name, sig))
+
+        # 获取所有交易日
+        first_code = list(stock_list.values())[0]
+        all_dates = self.data_source.get_daily_kline(first_code, start_date, end_date)
+        if all_dates.empty:
+            return {}
+
+        # 遍历交易日
+        for _, row in all_dates.iterrows():
+            date = row['date']
+
+            # 更新所有持仓市值
+            for code, pos in self.portfolio.positions.items():
+                # 简化：使用同一天的数据
+                pos.current_price = row['close']
+
+            self.equity_curve.append({
+                'date': date,
+                'equity': self.portfolio.total_value,
+                'cash': self.portfolio.cash,
+                'position_value': self.portfolio.total_value - self.portfolio.cash
+            })
+
+            # 执行信号
+            if date in all_signals:
+                for code, name, sig in all_signals[date]:
+                    if sig.signal == Signal.BUY:
+                        strategy = strategies.get(code, list(strategies.values())[0])
+                        quantity = strategy.calculate_position(
+                            self.portfolio.cash, sig.price, sig
+                        )
+                        if quantity > 0:
+                            self._execute_trade(date, code, name, 'buy', sig.price, quantity, sig.reason)
+                    elif sig.signal == Signal.SELL:
+                        if code in self.portfolio.positions:
+                            pos = self.portfolio.positions[code]
+                            if pos.quantity > 0:
+                                self._execute_trade(date, code, name, 'sell', sig.price, pos.quantity, sig.reason)
+
+        self._calculate_daily_returns()
+        return self._generate_report('PORTFOLIO', '组合回测')
+
+    def significance_test(self, report: Dict, benchmark_return: float = 0.03,
+                           n_bootstrap: int = 1000) -> Dict:
+        """
+        统计显著性检验
+        :param report: 回测报告
+        :param benchmark_return: 基准年化收益率
+        :param n_bootstrap: Bootstrap采样次数
+        :return: 检验结果
+        """
+        from scipy import stats as scipy_stats
+
+        if not report or not self.daily_returns:
+            return {'significant': False, 'reason': '数据不足'}
+
+        returns = np.array(self.daily_returns)
+        result = {}
+
+        # 1. t检验：策略日均收益是否显著大于0
+        daily_benchmark = (1 + benchmark_return) ** (1/252) - 1
+        excess_returns = returns - daily_benchmark
+
+        if len(excess_returns) > 1:
+            t_stat, p_value = scipy_stats.ttest_1samp(excess_returns, 0)
+            result['t_stat'] = t_stat
+            result['p_value'] = p_value / 2  # 单侧检验
+            result['t_significant'] = p_value / 2 < 0.05
+        else:
+            result['t_significant'] = False
+
+        # 2. Bootstrap置信区间
+        bootstrap_returns = []
+        n = len(returns)
+        for _ in range(n_bootstrap):
+            sample = np.random.choice(returns, size=n, replace=True)
+            bootstrap_returns.append(np.mean(sample) * 252)
+
+        ci_lower = np.percentile(bootstrap_returns, 2.5)
+        ci_upper = np.percentile(bootstrap_returns, 97.5)
+        result['bootstrap_ci'] = (ci_lower, ci_upper)
+        result['bootstrap_significant'] = ci_lower > benchmark_return
+
+        # 3. 综合判断
+        result['significant'] = result.get('t_significant', False) or result.get('bootstrap_significant', False)
+        result['annual_return'] = report.get('annual_return', 0)
+        result['benchmark_return'] = benchmark_return
+
+        return result
 
     def _calculate_daily_returns(self):
         """计算每日收益"""

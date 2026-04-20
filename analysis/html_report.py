@@ -167,7 +167,7 @@ class HTMLReportGenerator:
     def _render_html(self, stock_code, stock_name, start_date, end_date,
                      df, chart_data, score, recommendation,
                      macd_data, rsi, kdj, boll, ma5, ma10, ma20, news_analysis):
-        """渲染HTML页面"""
+        """渲染HTML页面（优化版：交互增强+风险预警）"""
 
         # 最新价格信息
         latest_price = df['close'].iloc[-1]
@@ -188,6 +188,58 @@ class HTMLReportGenerator:
         rec_color = rec_colors.get(recommendation, '#808080')
 
         score_color = '#DC143C' if score >= 30 else '#FF6347' if score >= 10 else '#808080' if score >= -10 else '#32CD32' if score >= -30 else '#228B22'
+
+        # 风险预警计算
+        risk_score = 0
+        risk_warnings = []
+        # RSI风险
+        rsi_val = rsi.iloc[-1] if not rsi.empty else 50
+        if rsi_val > 70:
+            risk_score += 30
+            risk_warnings.append(f"RSI超买({rsi_val:.1f})")
+        elif rsi_val < 30:
+            risk_score += 15
+            risk_warnings.append(f"RSI超卖({rsi_val:.1f})")
+        # 波动率风险
+        if 'close' in df.columns and len(df) >= 20:
+            vol = df['close'].pct_change().tail(20).std() * np.sqrt(252)
+            if vol > 0.4:
+                risk_score += 25
+                risk_warnings.append(f"高波动率({vol*100:.1f}%)")
+        # 布林带风险
+        if not boll['upper'].empty:
+            boll_pos = (df['close'].iloc[-1] - boll['lower'].iloc[-1]) / (boll['upper'].iloc[-1] - boll['lower'].iloc[-1])
+            if boll_pos > 0.9:
+                risk_score += 20
+                risk_warnings.append("接近布林上轨")
+        # KDJ风险
+        j_val = kdj['J'].iloc[-1] if not kdj['J'].empty else 50
+        if j_val > 90:
+            risk_score += 15
+            risk_warnings.append(f"KDJ超买(J={j_val:.1f})")
+        elif j_val < 10:
+            risk_score += 10
+            risk_warnings.append(f"KDJ超卖(J={j_val:.1f})")
+
+        risk_level = '低' if risk_score < 20 else '中' if risk_score < 40 else '高' if risk_score < 60 else '极高'
+        risk_color = '#28a745' if risk_score < 20 else '#ffc107' if risk_score < 40 else '#fd7e14' if risk_score < 60 else '#dc3545'
+
+        risk_html = ""
+        if risk_warnings:
+            risk_html = f"""
+            <div class="section">
+                <h2>【风险预警】</h2>
+                <div class="risk-dashboard">
+                    <div class="risk-gauge">
+                        <div class="risk-score" style="color: {risk_color}">{risk_score}</div>
+                        <div class="risk-level">风险等级: {risk_level}</div>
+                    </div>
+                    <div class="risk-warnings">
+                        {''.join(f'<div class="risk-warning-item" style="border-left: 3px solid {risk_color}">{w}</div>' for w in risk_warnings)}
+                    </div>
+                </div>
+            </div>
+            """
 
         # 消息面分析部分
         news_html = ""
@@ -375,6 +427,40 @@ class HTMLReportGenerator:
             color: #666;
             font-size: 12px;
         }}
+        .risk-dashboard {{
+            display: grid;
+            grid-template-columns: 200px 1fr;
+            gap: 20px;
+            align-items: center;
+        }}
+        .risk-gauge {{
+            text-align: center;
+            padding: 20px;
+            background: #fff;
+            border-radius: 15px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.08);
+        }}
+        .risk-score {{
+            font-size: 48px;
+            font-weight: bold;
+        }}
+        .risk-level {{
+            font-size: 16px;
+            color: #666;
+            margin-top: 5px;
+        }}
+        .risk-warnings {{
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }}
+        .risk-warning-item {{
+            padding: 10px 15px;
+            background: #fff;
+            border-radius: 8px;
+            font-size: 14px;
+            box-shadow: 0 1px 5px rgba(0,0,0,0.05);
+        }}
     </style>
 </head>
 <body>
@@ -457,6 +543,9 @@ class HTMLReportGenerator:
                 </div>
             </div>
 
+            <!-- 风险预警 -->
+            {risk_html}
+
             <!-- 消息面分析 -->
             {news_html}
         </div>
@@ -475,7 +564,11 @@ class HTMLReportGenerator:
         klineChart.setOption({{
             tooltip: {{ trigger: 'axis' }},
             legend: {{ data: ['收盘价', 'MA5', 'MA10', 'MA20', 'MA60', '布林上轨', '布林下轨'], top: 5 }},
-            grid: {{ left: '3%', right: '4%', bottom: '3%', top: '15%', containLabel: true }},
+            grid: {{ left: '3%', right: '4%', bottom: '15%', top: '15%', containLabel: true }},
+            dataZoom: [
+                {{ type: 'inside', start: 0, end: 100 }},
+                {{ type: 'slider', start: 0, end: 100, height: 20, bottom: 5 }}
+            ],
             xAxis: {{ type: 'category', data: chartData.dates, axisLabel: {{ rotate: 45 }} }},
             yAxis: {{ type: 'value', scale: true }},
             series: [
@@ -593,6 +686,164 @@ class HTMLReportGenerator:
         except Exception as e:
             logger.error(f"保存HTML报告失败: {e}")
             return False
+
+    def generate_comparison_report(self, strategy_results: Dict[str, Dict],
+                                    stock_name: str,
+                                    output_path: str = None) -> str:
+        """
+        生成策略绩效对比HTML报告
+        :param strategy_results: {策略名: 回测报告dict}
+        :param stock_name: 股票名称
+        :param output_path: 保存路径
+        :return: HTML字符串
+        """
+        import json
+
+        # 提取对比数据
+        strategies = list(strategy_results.keys())
+        metrics_keys = ['total_return', 'annual_return', 'sharpe_ratio',
+                        'max_drawdown', 'win_rate', 'profit_factor']
+        metric_names = ['总收益率', '年化收益率', '夏普比率', '最大回撤', '胜率', '盈利因子']
+
+        # 净值曲线数据
+        equity_data = {}
+        for name, report in strategy_results.items():
+            if report and 'equity_curve' in report:
+                curve = report['equity_curve']
+                equity_data[name] = {
+                    'dates': [d['date'].strftime('%Y-%m-%d') if hasattr(d['date'], 'strftime') else str(d['date']) for d in curve],
+                    'equity': [d['equity'] for d in curve]
+                }
+
+        # 指标对比表
+        metrics_table = []
+        for name, report in strategy_results.items():
+            if not report:
+                continue
+            row = {'策略': name}
+            for key in metrics_keys:
+                val = report.get(key, 0)
+                if key in ['total_return', 'annual_return', 'max_drawdown', 'win_rate']:
+                    row[metric_names[metrics_keys.index(key)]] = f"{val*100:.2f}%"
+                elif key == 'profit_factor':
+                    row[metric_names[metrics_keys.index(key)]] = f"{val:.2f}"
+                else:
+                    row[metric_names[metrics_keys.index(key)]] = f"{val:.3f}"
+            metrics_table.append(row)
+
+        # 雷达图数据
+        radar_data = {}
+        for name, report in strategy_results.items():
+            if not report:
+                continue
+            # 归一化到0-100
+            radar_data[name] = [
+                min(100, max(0, report.get('total_return', 0) * 500)),  # 收益率放大
+                min(100, max(0, report.get('sharpe_ratio', 0) * 40)),    # 夏普放大
+                min(100, max(0, (1 - report.get('max_drawdown', 1)) * 100)),  # 回撤反转
+                min(100, max(0, report.get('win_rate', 0) * 100)),       # 胜率
+                min(100, max(0, report.get('profit_factor', 0) * 30)),   # 盈利因子放大
+            ]
+
+        # 生成表格HTML
+        table_headers = metrics_table[0].keys() if metrics_table else []
+        table_rows = []
+        for row in metrics_table:
+            cells = [f"<td>{row.get(h, '')}</td>" for h in table_headers]
+            table_rows.append(f"<tr>{''.join(cells)}</tr>")
+
+        html = f"""
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>{stock_name} 策略绩效对比</title>
+    <script src="https://cdn.jsdelivr.net/npm/echarts@5.4.3/dist/echarts.min.js"></script>
+    <style>
+        * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+        body {{ font-family: -apple-system, sans-serif; background: #f5f7fa; padding: 20px; }}
+        .container {{ max-width: 1400px; margin: 0 auto; background: #fff; border-radius: 15px; box-shadow: 0 5px 20px rgba(0,0,0,0.1); overflow: hidden; }}
+        .header {{ background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); color: #fff; padding: 25px; text-align: center; }}
+        .content {{ padding: 25px; }}
+        .chart {{ width: 100%; height: 400px; margin-bottom: 20px; }}
+        table {{ width: 100%; border-collapse: collapse; margin: 15px 0; }}
+        th, td {{ padding: 10px 15px; text-align: center; border: 1px solid #eee; }}
+        th {{ background: #f8f9fa; font-weight: bold; }}
+        .charts-row {{ display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>{stock_name} 策略绩效对比</h1>
+            <div style="color:#aaa;font-size:13px">生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</div>
+        </div>
+        <div class="content">
+            <div class="chart" id="chart-equity"></div>
+            <div class="charts-row">
+                <div class="chart" id="chart-radar"></div>
+                <div></div>
+            </div>
+            <table>
+                <tr>{''.join(f'<th>{h}</th>' for h in table_headers)}</tr>
+                {''.join(table_rows)}
+            </table>
+        </div>
+    </div>
+    <script>
+        const equityData = {json.dumps(equity_data, default=str)};
+        const radarData = {json.dumps(radar_data)};
+
+        // 净值曲线对比
+        const equityChart = echarts.init(document.getElementById('chart-equity'));
+        const equitySeries = Object.entries(equityData).map(([name, data]) => ({{
+            name: name, type: 'line', data: data.equity,
+            lineStyle: {{ width: 2 }}
+        }}));
+        const firstKey = Object.keys(equityData)[0];
+        equityChart.setOption({{
+            title: {{ text: '策略净值曲线对比', left: 'center' }},
+            tooltip: {{ trigger: 'axis' }},
+            legend: {{ top: 30 }},
+            grid: {{ left: '3%', right: '4%', bottom: '15%', top: '20%', containLabel: true }},
+            dataZoom: [{{ type: 'slider', start: 0, end: 100 }}],
+            xAxis: {{ type: 'category', data: equityData[firstKey]?.dates || [] }},
+            yAxis: {{ type: 'value', scale: true }},
+            series: equitySeries
+        }});
+
+        // 雷达图
+        const radarChart = echarts.init(document.getElementById('chart-radar'));
+        const radarIndicators = [
+            {{ name: '收益率', max: 100 }},
+            {{ name: '夏普比率', max: 100 }},
+            {{ name: '回撤控制', max: 100 }},
+            {{ name: '胜率', max: 100 }},
+            {{ name: '盈利因子', max: 100 }}
+        ];
+        radarChart.setOption({{
+            title: {{ text: '多维指标对比', left: 'center' }},
+            tooltip: {{}},
+            legend: {{ top: 30, data: Object.keys(radarData) }},
+            radar: {{ indicator: radarIndicators, center: ['50%', '60%'], radius: '60%' }},
+            series: [{{ type: 'radar', data: Object.entries(radarData).map(([name, data]) => ({{ name, value: data }})) }}]
+        }});
+
+        window.addEventListener('resize', function() {{ equityChart.resize(); radarChart.resize(); }});
+    </script>
+</body>
+</html>
+        """
+
+        if output_path:
+            try:
+                with open(output_path, 'w', encoding='utf-8') as f:
+                    f.write(html)
+                logger.info(f"对比报告已保存: {output_path}")
+            except Exception as e:
+                logger.error(f"保存对比报告失败: {e}")
+
+        return html
 
 
 if __name__ == '__main__':

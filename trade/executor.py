@@ -153,12 +153,14 @@ class PaperTrader(TradeExecutor):
 
 
 class TdxTrader(TradeExecutor):
-    """通达信实盘交易"""
+    """通达信实盘交易（优化版：重试机制+防重复提交）"""
 
     def __init__(self, config: Dict):
         super().__init__()
         self.config = config
         self.trade_api = None
+        self._pending_orders: Dict[str, float] = {}  # {stock_code: last_submit_time}
+        self._dedup_interval = 5.0  # 防重复提交间隔(秒)
         self._connect()
 
     def _connect(self):
@@ -223,11 +225,19 @@ class TdxTrader(TradeExecutor):
 
     def execute_signal(self, signal: TradeSignal, stock_code: str,
                        stock_name: str, quantity: int = None) -> bool:
-        """执行交易信号（实盘）"""
+        """执行交易信号（实盘，带重试和防重复）"""
 
         if not self.trade_api:
             logger.error("未连接交易服务器")
             return False
+
+        # 防重复提交检查
+        now = time.time()
+        if stock_code in self._pending_orders:
+            elapsed = now - self._pending_orders[stock_code]
+            if elapsed < self._dedup_interval:
+                logger.warning(f"防重复提交: {stock_code} 在{elapsed:.1f}秒内已提交过")
+                return False
 
         if quantity is None:
             if signal.signal == Signal.BUY:
@@ -240,47 +250,68 @@ class TdxTrader(TradeExecutor):
             logger.warning("交易数量为0，跳过")
             return False
 
-        # 确定市场代码
+        # 带重试的执行
+        result = self._execute_with_retry(signal, stock_code, stock_name, quantity)
+
+        if result:
+            self._pending_orders[stock_code] = time.time()
+
+        return result
+
+    def _execute_with_retry(self, signal: TradeSignal, stock_code: str,
+                             stock_name: str, quantity: int,
+                             max_retries: int = 3, retry_interval: float = 0.1) -> bool:
+        """带重试的交易执行"""
         market = 1 if stock_code.startswith('6') else 0
 
-        try:
-            if signal.signal == Signal.BUY:
-                # 买入
-                result = self.trade_api.buy(
-                    market, stock_code, signal.price, quantity
-                )
-                if result:
-                    logger.info(f"[买入委托] {stock_name} {quantity}股 @ {signal.price:.2f}")
-                    self.trade_history.append({
-                        'time': datetime.now(),
-                        'stock_code': stock_code,
-                        'stock_name': stock_name,
-                        'action': 'buy',
-                        'price': signal.price,
-                        'quantity': quantity,
-                        'reason': signal.reason
-                    })
-                    return True
-            else:
-                # 卖出
-                result = self.trade_api.sell(
-                    market, stock_code, signal.price, quantity
-                )
-                if result:
-                    logger.info(f"[卖出委托] {stock_name} {quantity}股 @ {signal.price:.2f}")
-                    self.trade_history.append({
-                        'time': datetime.now(),
-                        'stock_code': stock_code,
-                        'stock_name': stock_name,
-                        'action': 'sell',
-                        'price': signal.price,
-                        'quantity': quantity,
-                        'reason': signal.reason
-                    })
-                    return True
+        for attempt in range(1, max_retries + 1):
+            try:
+                if signal.signal == Signal.BUY:
+                    result = self.trade_api.buy(
+                        market, stock_code, signal.price, quantity
+                    )
+                    if result:
+                        logger.info(f"[买入委托] {stock_name} {quantity}股 @ {signal.price:.2f}")
+                        self.trade_history.append({
+                            'time': datetime.now(),
+                            'stock_code': stock_code,
+                            'stock_name': stock_name,
+                            'action': 'buy',
+                            'price': signal.price,
+                            'quantity': quantity,
+                            'reason': signal.reason
+                        })
+                        return True
+                else:
+                    result = self.trade_api.sell(
+                        market, stock_code, signal.price, quantity
+                    )
+                    if result:
+                        logger.info(f"[卖出委托] {stock_name} {quantity}股 @ {signal.price:.2f}")
+                        self.trade_history.append({
+                            'time': datetime.now(),
+                            'stock_code': stock_code,
+                            'stock_name': stock_name,
+                            'action': 'sell',
+                            'price': signal.price,
+                            'quantity': quantity,
+                            'reason': signal.reason
+                        })
+                        return True
 
-        except Exception as e:
-            logger.error(f"交易执行失败: {e}")
+                # 执行失败
+                if attempt < max_retries:
+                    logger.warning(f"交易执行失败，第{attempt}次重试...")
+                    time.sleep(retry_interval)
+                else:
+                    logger.error(f"交易执行失败，已重试{max_retries}次")
+
+            except Exception as e:
+                if attempt < max_retries:
+                    logger.warning(f"交易异常: {e}，第{attempt}次重试...")
+                    time.sleep(retry_interval)
+                else:
+                    logger.error(f"交易执行异常，已重试{max_retries}次: {e}")
 
         return False
 

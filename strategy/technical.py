@@ -133,13 +133,18 @@ class TechnicalIndicators:
 
 
 class MAStrategy(BaseStrategy):
-    """均线策略"""
+    """均线策略（优化版：成交量+RSI过滤假信号）"""
 
     def __init__(self, params: Dict = None):
         default_params = {
             'short_period': 5,
             'mid_period': 20,
             'long_period': 60,
+            'volume_confirm': True,    # 成交量确认
+            'rsi_filter': True,        # RSI过滤
+            'volume_ratio_threshold': 1.2,  # 量比阈值
+            'rsi_overbought': 70,      # RSI超买线
+            'rsi_oversold': 30,        # RSI超卖线
         }
         if params:
             default_params.update(params)
@@ -154,6 +159,13 @@ class MAStrategy(BaseStrategy):
         ma_mid = TechnicalIndicators.SMA(close, self.params['mid_period'])
         ma_long = TechnicalIndicators.SMA(close, self.params['long_period'])
 
+        # 计算RSI（用于过滤）
+        rsi = TechnicalIndicators.RSI(close, 14) if self.params.get('rsi_filter') else None
+
+        # 计算成交量均线（用于确认）
+        if self.params.get('volume_confirm') and 'volume' in data.columns:
+            vol_ma5 = data['volume'].rolling(5).mean()
+
         # 均线多头/空头排列
         for i in range(1, len(data)):
             # 金叉买入：短期均线上穿中期均线
@@ -161,21 +173,55 @@ class MAStrategy(BaseStrategy):
                ma_short.iloc[i] > ma_mid.iloc[i]:
                 # 确认长期均线向上
                 if ma_long.iloc[i] > ma_long.iloc[i-1]:
+                    confidence = 0.7
+                    reason = f"MA{self.params['short_period']}金叉MA{self.params['mid_period']}，且长期均线向上"
+
+                    # RSI过滤：避免超买区假信号
+                    if self.params.get('rsi_filter') and rsi is not None:
+                        if rsi.iloc[i] > self.params['rsi_overbought']:
+                            continue  # RSI超买，跳过
+                        elif rsi.iloc[i] < self.params['rsi_oversold']:
+                            confidence += 0.1  # RSI超卖区金叉更可靠
+
+                    # 成交量确认：放量金叉更可靠
+                    if self.params.get('volume_confirm') and 'volume' in data.columns:
+                        vol_ratio = data['volume'].iloc[i] / vol_ma5.iloc[i] if vol_ma5.iloc[i] > 0 else 1
+                        if vol_ratio > self.params['volume_ratio_threshold']:
+                            confidence += 0.1  # 放量确认
+                            reason += f"，放量(量比{vol_ratio:.1f})"
+                        else:
+                            confidence -= 0.1  # 缩量金叉降低置信度
+
                     signals.append(TradeSignal(
                         signal=Signal.BUY,
                         price=data['close'].iloc[i],
-                        reason=f"MA{self.params['short_period']}金叉MA{self.params['mid_period']}，且长期均线向上",
-                        confidence=0.7
+                        reason=reason,
+                        confidence=min(confidence, 1.0)
                     ))
 
             # 死叉卖出：短期均线下穿中期均线
             elif ma_short.iloc[i-1] >= ma_mid.iloc[i-1] and \
                  ma_short.iloc[i] < ma_mid.iloc[i]:
+                confidence = 0.6
+                reason = f"MA{self.params['short_period']}死叉MA{self.params['mid_period']}"
+
+                # RSI过滤
+                if self.params.get('rsi_filter') and rsi is not None:
+                    if rsi.iloc[i] < self.params['rsi_oversold']:
+                        confidence -= 0.1  # RSI超卖区死叉可能反弹
+
+                # 成交量确认
+                if self.params.get('volume_confirm') and 'volume' in data.columns:
+                    vol_ratio = data['volume'].iloc[i] / vol_ma5.iloc[i] if vol_ma5.iloc[i] > 0 else 1
+                    if vol_ratio > self.params['volume_ratio_threshold']:
+                        confidence += 0.1  # 放量死叉更可靠
+                        reason += f"，放量(量比{vol_ratio:.1f})"
+
                 signals.append(TradeSignal(
                     signal=Signal.SELL,
                     price=data['close'].iloc[i],
-                    reason=f"MA{self.params['short_period']}死叉MA{self.params['mid_period']}",
-                    confidence=0.6
+                    reason=reason,
+                    confidence=min(confidence, 1.0)
                 ))
 
         return signals
@@ -188,13 +234,18 @@ class MAStrategy(BaseStrategy):
 
 
 class MACDStrategy(BaseStrategy):
-    """MACD策略"""
+    """MACD策略（优化版：增加顶底背离检测、柱状图确认）"""
 
     def __init__(self, params: Dict = None):
         default_params = {
             'fast': 12,
             'slow': 26,
             'signal': 9,
+            'short_line_fast': 8,   # A股短线参数
+            'short_line_slow': 21,
+            'short_line_signal': 5,
+            'use_short_line': False,  # 是否使用短线参数
+            'detect_divergence': True,  # 背离检测
         }
         if params:
             default_params.update(params)
@@ -203,11 +254,18 @@ class MACDStrategy(BaseStrategy):
     def generate_signals(self, data: pd.DataFrame) -> List[TradeSignal]:
         signals = []
 
+        # 选择参数组
+        if self.params.get('use_short_line'):
+            fast = self.params['short_line_fast']
+            slow = self.params['short_line_slow']
+            sig_period = self.params['short_line_signal']
+        else:
+            fast = self.params['fast']
+            slow = self.params['slow']
+            sig_period = self.params['signal']
+
         macd_data = TechnicalIndicators.MACD(
-            data['close'],
-            self.params['fast'],
-            self.params['slow'],
-            self.params['signal']
+            data['close'], fast, slow, sig_period
         )
 
         macd = macd_data['macd']
@@ -218,42 +276,95 @@ class MACDStrategy(BaseStrategy):
             # MACD金叉
             if macd.iloc[i-1] <= signal_line.iloc[i-1] and \
                macd.iloc[i] > signal_line.iloc[i]:
+                confidence = 0.6
+                reason_parts = []
+
                 # MACD在零轴上方，信号更强
                 if macd.iloc[i] > 0:
-                    signals.append(TradeSignal(
-                        signal=Signal.BUY,
-                        price=data['close'].iloc[i],
-                        reason="MACD金叉，零轴上方",
-                        confidence=0.8
-                    ))
+                    confidence = 0.8
+                    reason_parts.append("零轴上方")
                 else:
-                    signals.append(TradeSignal(
-                        signal=Signal.BUY,
-                        price=data['close'].iloc[i],
-                        reason="MACD金叉，零轴下方（弱势金叉）",
-                        confidence=0.5
-                    ))
+                    reason_parts.append("零轴下方(弱势)")
+
+                # 柱状图放大确认
+                if hist.iloc[i] > 0 and hist.iloc[i] > hist.iloc[i-1]:
+                    confidence += 0.05
+                    reason_parts.append("红柱放大")
+
+                # 背离检测：价格创新低但MACD未创新低
+                if self.params.get('detect_divergence') and i >= 20:
+                    if self._check_bullish_divergence(data['close'], macd, i):
+                        confidence += 0.1
+                        reason_parts.append("底背离")
+
+                signals.append(TradeSignal(
+                    signal=Signal.BUY,
+                    price=data['close'].iloc[i],
+                    reason=f"MACD金叉({'+'.join(reason_parts)})",
+                    confidence=min(confidence, 1.0)
+                ))
 
             # MACD死叉
             elif macd.iloc[i-1] >= signal_line.iloc[i-1] and \
                  macd.iloc[i] < signal_line.iloc[i]:
+                confidence = 0.6
+                reason_parts = []
+
                 # MACD在零轴下方，信号更强
                 if macd.iloc[i] < 0:
-                    signals.append(TradeSignal(
-                        signal=Signal.SELL,
-                        price=data['close'].iloc[i],
-                        reason="MACD死叉，零轴下方",
-                        confidence=0.8
-                    ))
+                    confidence = 0.8
+                    reason_parts.append("零轴下方")
                 else:
-                    signals.append(TradeSignal(
-                        signal=Signal.SELL,
-                        price=data['close'].iloc[i],
-                        reason="MACD死叉，零轴上方",
-                        confidence=0.5
-                    ))
+                    reason_parts.append("零轴上方")
+
+                # 柱状图放大确认
+                if hist.iloc[i] < 0 and hist.iloc[i] < hist.iloc[i-1]:
+                    confidence += 0.05
+                    reason_parts.append("绿柱放大")
+
+                # 顶背离检测
+                if self.params.get('detect_divergence') and i >= 20:
+                    if self._check_bearish_divergence(data['close'], macd, i):
+                        confidence += 0.1
+                        reason_parts.append("顶背离")
+
+                signals.append(TradeSignal(
+                    signal=Signal.SELL,
+                    price=data['close'].iloc[i],
+                    reason=f"MACD死叉({'+'.join(reason_parts)})",
+                    confidence=min(confidence, 1.0)
+                ))
 
         return signals
+
+    def _check_bullish_divergence(self, close: pd.Series, macd: pd.Series,
+                                   idx: int, lookback: int = 20) -> bool:
+        """检测底背离：价格创新低但MACD未创新低"""
+        if idx < lookback:
+            return False
+        recent_close = close.iloc[idx-lookback:idx+1]
+        recent_macd = macd.iloc[idx-lookback:idx+1]
+        # 价格近期的最低点
+        price_min_idx = recent_close.idxmin()
+        # MACD近期的最低点
+        macd_min_idx = recent_macd.idxmin()
+        # 价格创新低但MACD没创新低
+        if price_min_idx == recent_close.index[-1] and macd_min_idx != recent_macd.index[-1]:
+            return True
+        return False
+
+    def _check_bearish_divergence(self, close: pd.Series, macd: pd.Series,
+                                   idx: int, lookback: int = 20) -> bool:
+        """检测顶背离：价格创新高但MACD未创新高"""
+        if idx < lookback:
+            return False
+        recent_close = close.iloc[idx-lookback:idx+1]
+        recent_macd = macd.iloc[idx-lookback:idx+1]
+        price_max_idx = recent_close.idxmax()
+        macd_max_idx = recent_macd.idxmax()
+        if price_max_idx == recent_close.index[-1] and macd_max_idx != recent_macd.index[-1]:
+            return True
+        return False
 
     def calculate_position(self, capital: float, price: float,
                           signal: TradeSignal) -> int:
@@ -407,7 +518,7 @@ class BollingerStrategy(BaseStrategy):
 
 class CompositeStrategy(BaseStrategy):
     """
-    综合技术策略
+    综合技术策略（优化版：加权打分制，权重可配置）
     多个指标共振时才产生信号
     """
 
@@ -422,7 +533,13 @@ class CompositeStrategy(BaseStrategy):
             'macd_fast': 12,
             'macd_slow': 26,
             'macd_signal': 9,
-            'min_signals': 2,  # 最少需要几个指标共振
+            'min_score': 0.3,    # 最低触发分数(0-1)，替代min_signals
+            'weights': {         # 指标权重
+                'ma': 0.30,
+                'macd': 0.25,
+                'rsi': 0.20,
+                'kdj': 0.25,
+            },
         }
         if params:
             default_params.update(params)
@@ -448,62 +565,64 @@ class CompositeStrategy(BaseStrategy):
 
         kdj = TechnicalIndicators.KDJ(data['high'], data['low'], data['close'])
 
+        weights = self.params.get('weights', {'ma': 0.30, 'macd': 0.25, 'rsi': 0.20, 'kdj': 0.25})
+
         for i in range(max(self.params['ma_long'], 30), len(data)):
             buy_score = 0
             sell_score = 0
             reasons = []
 
-            # MA判断
+            # MA判断（权重：weights['ma']）
             if ma_short.iloc[i] > ma_mid.iloc[i] and \
                ma_mid.iloc[i] > ma_long.iloc[i]:
-                buy_score += 1
+                buy_score += weights.get('ma', 0.30)
                 reasons.append("均线多头排列")
             elif ma_short.iloc[i] < ma_mid.iloc[i] and \
                  ma_mid.iloc[i] < ma_long.iloc[i]:
-                sell_score += 1
+                sell_score += weights.get('ma', 0.30)
                 reasons.append("均线空头排列")
 
-            # RSI判断
+            # RSI判断（权重：weights['rsi']）
             if rsi.iloc[i] < self.params['rsi_oversold']:
-                buy_score += 1
+                buy_score += weights.get('rsi', 0.20)
                 reasons.append(f"RSI超卖({rsi.iloc[i]:.1f})")
             elif rsi.iloc[i] > self.params['rsi_overbought']:
-                sell_score += 1
+                sell_score += weights.get('rsi', 0.20)
                 reasons.append(f"RSI超买({rsi.iloc[i]:.1f})")
 
-            # MACD判断
+            # MACD判断（权重：weights['macd']）
             if macd_data['hist'].iloc[i] > 0 and \
                macd_data['hist'].iloc[i] > macd_data['hist'].iloc[i-1]:
-                buy_score += 1
+                buy_score += weights.get('macd', 0.25)
                 reasons.append("MACD红柱放大")
             elif macd_data['hist'].iloc[i] < 0 and \
                  macd_data['hist'].iloc[i] < macd_data['hist'].iloc[i-1]:
-                sell_score += 1
+                sell_score += weights.get('macd', 0.25)
                 reasons.append("MACD绿柱放大")
 
-            # KDJ判断
+            # KDJ判断（权重：weights['kdj']）
             if kdj['J'].iloc[i] < 20:
-                buy_score += 1
+                buy_score += weights.get('kdj', 0.25)
                 reasons.append(f"KDJ超卖(J={kdj['J'].iloc[i]:.1f})")
             elif kdj['J'].iloc[i] > 80:
-                sell_score += 1
+                sell_score += weights.get('kdj', 0.25)
                 reasons.append(f"KDJ超买(J={kdj['J'].iloc[i]:.1f})")
 
-            # 生成信号
-            min_sig = self.params['min_signals']
-            if buy_score >= min_sig:
+            # 生成信号（加权打分制）
+            min_score = self.params.get('min_score', 0.3)
+            if buy_score >= min_score:
                 signals.append(TradeSignal(
                     signal=Signal.BUY,
                     price=close.iloc[i],
                     reason=f"多指标共振买入({'+'.join(reasons[:3])})",
-                    confidence=min(buy_score / 4, 1.0)
+                    confidence=min(buy_score, 1.0)
                 ))
-            elif sell_score >= min_sig:
+            elif sell_score >= min_score:
                 signals.append(TradeSignal(
                     signal=Signal.SELL,
                     price=close.iloc[i],
                     reason=f"多指标共振卖出({'+'.join(reasons[:3])})",
-                    confidence=min(sell_score / 4, 1.0)
+                    confidence=min(sell_score, 1.0)
                 ))
 
         return signals

@@ -9,6 +9,9 @@ from .sentiment import (
     NewsSentimentStrategy, MoneyFlowStrategy,
     CompositeSentimentStrategy, SentimentAnalyzer
 )
+from .intraday import (
+    IntradayVolumePriceStrategy, RSIMeanReversionStrategy
+)
 
 __all__ = [
     'BaseStrategy', 'Signal', 'TradeSignal',
@@ -16,5 +19,6 @@ __all__ = [
     'BollingerStrategy', 'CompositeStrategy',
     'TechnicalIndicators',
     'NewsSentimentStrategy', 'MoneyFlowStrategy',
-    'CompositeSentimentStrategy', 'SentimentAnalyzer'
+    'CompositeSentimentStrategy', 'SentimentAnalyzer',
+    'IntradayVolumePriceStrategy', 'RSIMeanReversionStrategy',
 ]

@@ -41,6 +41,16 @@ RISK_CONFIG = {
     'trailing_stop_pct': 0.05,      # 追踪止损回撤比例 5%
     'atr_multiplier': 2.0,          # ATR止损倍数
     'risk_free_rate': 0.03,         # 无风险利率
+    # 新增：动态仓位范围
+    'min_position_pct': 0.15,       # 最低单只仓位(熊市)
+    'max_position_pct_dynamic': 0.25,  # 最高单只仓位(牛市)
+    # 新增：极端行情配置
+    'emergency_drop_threshold': 0.03,  # 大盘暴跌阈值
+    'limit_down_threshold': -0.095,    # 跌停判断阈值
+    # 新增：策略失效检测
+    'max_consecutive_losses': 3,    # 最大连续亏损次数
+    'min_win_rate': 0.4,           # 最低胜率
+    'win_rate_window': 20,         # 胜率计算窗口
 }
 
 # 仓位管理配置
@@ -81,6 +91,9 @@ DATA_CONFIG = {
     'cache_dir': os.path.expanduser('~/.quant_trading/cache'),
     'cache_expire_hours': 4,
     'use_cache': True,
+    # 新增：缓存优化配置
+    'max_memory_items': 100,       # 内存缓存最大条目数
+    'max_memory_size_mb': 500,     # 内存缓存最大占用(MB)
 }
 
 # 优化配置

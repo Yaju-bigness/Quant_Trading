@@ -15,6 +15,12 @@ from data.data_source import DataSource
 from strategy.technical import TechnicalIndicators
 from strategy.sentiment import SentimentAnalyzer
 
+try:
+    import akshare as ak
+    AKSHARE_AVAILABLE = True
+except ImportError:
+    AKSHARE_AVAILABLE = False
+
 
 class NewsAnalyzer:
     """消息面分析"""
@@ -790,6 +796,10 @@ class MarketAnalyzer:
         """
         分析市场情绪
         """
+        if not AKSHARE_AVAILABLE:
+            logger.warning("akshare未安装，无法进行市场情绪分析")
+            return {}
+
         try:
             # 获取涨跌停数据
             up_limit = ak.stock_zt_pool_em(date=datetime.now().strftime('%Y%m%d'))
@@ -817,12 +827,372 @@ class MarketAnalyzer:
         """
         获取板块表现
         """
+        if not AKSHARE_AVAILABLE:
+            logger.warning("akshare未安装，无法获取板块数据")
+            return pd.DataFrame()
+
         try:
             df = ak.stock_board_industry_name_em()
             return df
         except Exception as e:
             logger.error(f"获取板块数据失败: {e}")
             return pd.DataFrame()
+
+    def analyze_today_volume(self, stock_code: str) -> Dict:
+        """
+        分析今日交易量
+        :param stock_code: 股票代码
+        :return: 交易量分析结果
+        """
+        try:
+            # 获取最近30天K线数据
+            end_date = datetime.now().strftime('%Y-%m-%d')
+            start_date = (datetime.now() - timedelta(days=60)).strftime('%Y-%m-%d')
+
+            df = self.data_source.get_daily_kline(stock_code, start_date, end_date)
+            if df.empty or len(df) < 5:
+                return {'status': '数据不足', 'score': 0}
+
+            # 最新一日数据
+            latest = df.iloc[-1]
+            prev = df.iloc[-2] if len(df) > 1 else df.iloc[-1]
+
+            volume = latest['volume']
+            amount = latest.get('amount', volume * latest['close'])
+
+            # 计算成交量均线
+            vol_ma5 = df['volume'].tail(5).mean()
+            vol_ma10 = df['volume'].tail(10).mean()
+            vol_ma20 = df['volume'].tail(20).mean()
+
+            # 量比 = 今日成交量 / 5日均量
+            volume_ratio = volume / vol_ma5 if vol_ma5 > 0 else 1
+
+            # 换手率（如果有）
+            turnover = latest.get('turnover', 0)
+
+            # 成交额变化
+            amount_ma5 = df['amount'].tail(5).mean() if 'amount' in df.columns else vol_ma5 * df['close'].tail(5).mean()
+            amount_ratio = amount / amount_ma5 if amount_ma5 > 0 else 1
+
+            # 价格涨跌
+            price_change = (latest['close'] - prev['close']) / prev['close'] * 100 if prev['close'] > 0 else 0
+
+            # 判断量能状态
+            if volume_ratio > 2.0:
+                volume_status = '巨量'
+                volume_score = 0.8
+            elif volume_ratio > 1.5:
+                volume_status = '放量'
+                volume_score = 0.5
+            elif volume_ratio > 1.0:
+                volume_status = '温和放量'
+                volume_score = 0.2
+            elif volume_ratio > 0.7:
+                volume_status = '正常'
+                volume_score = 0
+            elif volume_ratio > 0.5:
+                volume_status = '缩量'
+                volume_score = -0.2
+            else:
+                volume_status = '地量'
+                volume_score = -0.3
+
+            # 价量配合分析
+            if price_change > 0 and volume_ratio > 1.2:
+                price_volume_status = '价涨量增（健康）'
+                price_volume_score = 0.5
+            elif price_change > 0 and volume_ratio < 0.8:
+                price_volume_status = '价涨量缩（背离）'
+                price_volume_score = -0.3
+            elif price_change < 0 and volume_ratio > 1.2:
+                price_volume_status = '价跌量增（恐慌）'
+                price_volume_score = -0.4
+            elif price_change < 0 and volume_ratio < 0.8:
+                price_volume_status = '价跌量缩（惜售）'
+                price_volume_score = 0.1
+            else:
+                price_volume_status = '价量正常'
+                price_volume_score = 0
+
+            # 综合评分
+            total_score = volume_score + price_volume_score
+
+            return {
+                'volume': volume,
+                'amount': amount,
+                'volume_ratio': volume_ratio,
+                'amount_ratio': amount_ratio,
+                'vol_ma5': vol_ma5,
+                'vol_ma10': vol_ma10,
+                'vol_ma20': vol_ma20,
+                'turnover': turnover,
+                'volume_status': volume_status,
+                'price_change_pct': price_change,
+                'price_volume_status': price_volume_status,
+                'score': total_score,
+                'suggestion': self._get_volume_suggestion(volume_status, price_volume_status)
+            }
+        except Exception as e:
+            logger.error(f"今日交易量分析失败: {e}")
+            return {'status': '分析失败', 'score': 0}
+
+    def _get_volume_suggestion(self, volume_status: str, price_volume_status: str) -> str:
+        """根据量能状态给出建议"""
+        if '价涨量增' in price_volume_status:
+            return '量价配合良好，上涨趋势健康'
+        elif '价涨量缩' in price_volume_status:
+            return '量价背离，注意回调风险'
+        elif '价跌量增' in price_volume_status:
+            return '放量下跌，可能存在恐慌抛售'
+        elif '价跌量缩' in price_volume_status:
+            return '缩量下跌，抛压较轻'
+        elif volume_status in ['巨量', '放量']:
+            return '成交活跃，关注资金动向'
+        elif volume_status in ['缩量', '地量']:
+            return '成交清淡，市场观望情绪浓厚'
+        return '量能正常'
+
+    def analyze_market_overview(self) -> Dict:
+        """
+        大盘情绪分析
+        :return: 大盘分析结果
+        """
+        result = {
+            'indices': {},
+            'market_breadth': {},
+            'sentiment': '中性',
+            'score': 0,
+            'suggestion': ''
+        }
+
+        try:
+            # 1. 获取主要指数数据
+            indices_df = self.data_source.get_index_realtime()
+            if not indices_df.empty:
+                for _, row in indices_df.iterrows():
+                    code = row.get('code', '')
+                    name = row.get('name', '')
+                    pct_change = row.get('pct_change', 0)
+
+                    # 处理pct_change可能是字符串的情况
+                    if isinstance(pct_change, str):
+                        pct_change = float(pct_change.replace('%', ''))
+
+                    result['indices'][code] = {
+                        'name': name,
+                        'pct_change': pct_change,
+                        'price': row.get('price', 0),
+                        'volume': row.get('volume', 0),
+                        'amount': row.get('amount', 0)
+                    }
+
+            # 2. 获取市场涨跌统计
+            overview = self.data_source.get_market_overview()
+            if overview:
+                result['market_breadth'] = overview
+
+            # 3. 计算市场情绪得分
+            score = 0
+
+            # 指数涨跌贡献
+            for code, idx_data in result['indices'].items():
+                pct = idx_data.get('pct_change', 0)
+                if pct > 1:
+                    score += 20
+                elif pct > 0.5:
+                    score += 10
+                elif pct < -1:
+                    score -= 20
+                elif pct < -0.5:
+                    score -= 10
+
+            # 涨跌比贡献
+            if overview:
+                up_ratio = overview.get('up_ratio', 0.5)
+                if up_ratio > 0.7:
+                    score += 25
+                elif up_ratio > 0.55:
+                    score += 10
+                elif up_ratio < 0.3:
+                    score -= 25
+                elif up_ratio < 0.45:
+                    score -= 10
+
+                # 涨跌停贡献
+                limit_up = overview.get('limit_up', 0)
+                limit_down = overview.get('limit_down', 0)
+                if limit_up > 80:
+                    score += 15
+                elif limit_up > 50:
+                    score += 8
+                if limit_down > 50:
+                    score -= 15
+                elif limit_down > 30:
+                    score -= 8
+
+            result['score'] = score
+
+            # 4. 判断市场情绪
+            if score > 40:
+                result['sentiment'] = '极度亢奋'
+                result['suggestion'] = '市场情绪高涨，注意追高风险'
+            elif score > 20:
+                result['sentiment'] = '偏强'
+                result['suggestion'] = '市场情绪较好，可适度参与'
+            elif score > 0:
+                result['sentiment'] = '偏暖'
+                result['suggestion'] = '市场情绪温和，谨慎操作'
+            elif score > -20:
+                result['sentiment'] = '中性偏弱'
+                result['suggestion'] = '市场情绪一般，建议观望'
+            elif score > -40:
+                result['sentiment'] = '偏弱'
+                result['suggestion'] = '市场情绪低迷，控制仓位'
+            else:
+                result['sentiment'] = '极度低迷'
+                result['suggestion'] = '市场情绪恐慌，等待企稳'
+
+        except Exception as e:
+            logger.error(f"大盘情绪分析失败: {e}")
+
+        return result
+
+    def analyze_sector_sentiment(self, top_n: int = 10) -> Dict:
+        """
+        板块情绪分析
+        :param top_n: 返回前N个板块
+        :return: 板块分析结果
+        """
+        result = {
+            'hot_sectors': [],      # 热门板块
+            'weak_sectors': [],     # 弱势板块
+            'industry_sectors': [], # 行业板块详情
+            'concept_sectors': [],  # 概念板块详情
+            'sentiment': '中性',
+            'score': 0,
+            'suggestion': ''
+        }
+
+        try:
+            # 1. 获取行业板块数据
+            industry_df = self.data_source.get_sector_data()
+            if not industry_df.empty:
+                # 按涨跌幅排序
+                if 'pct_change' in industry_df.columns:
+                    industry_df['pct_change_num'] = pd.to_numeric(industry_df['pct_change'], errors='coerce')
+                    industry_df = industry_df.sort_values('pct_change_num', ascending=False)
+
+                    # 热门板块
+                    hot = industry_df.head(top_n)
+                    for _, row in hot.iterrows():
+                        result['hot_sectors'].append({
+                            'name': row.get('name', ''),
+                            'code': row.get('code', ''),
+                            'pct_change': row.get('pct_change', 0),
+                            'leading_stock': row.get('leading_stock', ''),
+                            'amount': row.get('amount', 0)
+                        })
+
+                    # 弱势板块
+                    weak = industry_df.tail(top_n)
+                    for _, row in weak.iloc[::-1].iterrows():
+                        result['weak_sectors'].append({
+                            'name': row.get('name', ''),
+                            'code': row.get('code', ''),
+                            'pct_change': row.get('pct_change', 0),
+                            'leading_stock': row.get('leading_stock', ''),
+                            'amount': row.get('amount', 0)
+                        })
+
+                result['industry_sectors'] = industry_df.to_dict('records')[:30]
+
+            # 2. 获取概念板块数据
+            concept_df = self.data_source.get_concept_sectors()
+            if not concept_df.empty:
+                if 'pct_change' in concept_df.columns:
+                    concept_df['pct_change_num'] = pd.to_numeric(concept_df['pct_change'], errors='coerce')
+                    concept_df = concept_df.sort_values('pct_change_num', ascending=False)
+
+                result['concept_sectors'] = concept_df.to_dict('records')[:30]
+
+            # 3. 计算板块情绪得分
+            score = 0
+
+            if result['hot_sectors']:
+                # 热门板块平均涨幅
+                hot_avg = 0
+                for s in result['hot_sectors'][:5]:
+                    pct = s.get('pct_change', 0)
+                    if isinstance(pct, str):
+                        pct = float(pct.replace('%', ''))
+                    hot_avg += pct
+                hot_avg /= 5
+
+                if hot_avg > 3:
+                    score += 30
+                elif hot_avg > 1.5:
+                    score += 15
+                elif hot_avg > 0.5:
+                    score += 5
+
+            if result['weak_sectors']:
+                # 弱势板块平均跌幅
+                weak_avg = 0
+                for s in result['weak_sectors'][:5]:
+                    pct = s.get('pct_change', 0)
+                    if isinstance(pct, str):
+                        pct = float(pct.replace('%', ''))
+                    weak_avg += pct
+                weak_avg /= 5
+
+                if weak_avg < -3:
+                    score -= 30
+                elif weak_avg < -1.5:
+                    score -= 15
+                elif weak_avg < -0.5:
+                    score -= 5
+
+            # 统计涨跌板块数量
+            if not industry_df.empty and 'pct_change_num' in industry_df.columns:
+                up_count = len(industry_df[industry_df['pct_change_num'] > 0])
+                down_count = len(industry_df[industry_df['pct_change_num'] < 0])
+                total = up_count + down_count
+
+                if total > 0:
+                    up_ratio = up_count / total
+                    if up_ratio > 0.7:
+                        score += 20
+                    elif up_ratio > 0.55:
+                        score += 10
+                    elif up_ratio < 0.3:
+                        score -= 20
+                    elif up_ratio < 0.45:
+                        score -= 10
+
+            result['score'] = score
+
+            # 4. 判断板块情绪
+            if score > 30:
+                result['sentiment'] = '板块普涨'
+                result['suggestion'] = '板块轮动活跃，热点明确，可积极参与'
+            elif score > 15:
+                result['sentiment'] = '偏强'
+                result['suggestion'] = '板块多数上涨，关注热点持续性'
+            elif score > 0:
+                result['sentiment'] = '分化'
+                result['suggestion'] = '板块涨跌互现，精选强势板块'
+            elif score > -15:
+                result['sentiment'] = '偏弱'
+                result['suggestion'] = '板块多数下跌，控制仓位'
+            else:
+                result['sentiment'] = '普跌'
+                result['suggestion'] = '板块普遍下跌，规避风险'
+
+        except Exception as e:
+            logger.error(f"板块情绪分析失败: {e}")
+
+        return result
 
 
 class ReportGenerator:

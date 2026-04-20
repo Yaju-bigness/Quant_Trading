@@ -75,3 +75,47 @@ class BaseStrategy(ABC):
         """验证数据格式"""
         required_columns = ['date', 'open', 'high', 'low', 'close', 'volume']
         return all(col in data.columns for col in required_columns)
+
+    def auto_adjust_params(self, data: pd.DataFrame):
+        """
+        根据近期市场波动率自动调整策略参数
+        - 波动率高时：扩大止损范围、缩短均线周期
+        - 波动率低时：缩小止损范围、延长均线周期
+        """
+        if data.empty or len(data) < 20:
+            return
+
+        close = data['close']
+        # 计算20日年化波动率
+        returns = close.pct_change().dropna()
+        if len(returns) < 20:
+            return
+        recent_vol = returns.tail(20).std() * np.sqrt(252)
+
+        # 波动率分位判断
+        if recent_vol > 0.4:  # 高波动
+            vol_level = 'high'
+        elif recent_vol < 0.15:  # 低波动
+            vol_level = 'low'
+        else:
+            vol_level = 'normal'
+
+        # 根据波动率调整参数
+        if vol_level == 'high':
+            # 缩短均线周期，提高灵敏度
+            if 'short_period' in self.params:
+                self.params['short_period'] = max(3, self.params.get('short_period', 5) - 2)
+            if 'mid_period' in self.params:
+                self.params['mid_period'] = max(10, self.params.get('mid_period', 20) - 5)
+            if 'stop_loss_pct' in self.params:
+                self.params['stop_loss_pct'] = min(0.15, self.params.get('stop_loss_pct', 0.08) + 0.02)
+        elif vol_level == 'low':
+            # 延长均线周期，降低噪音
+            if 'short_period' in self.params:
+                self.params['short_period'] = min(15, self.params.get('short_period', 5) + 2)
+            if 'mid_period' in self.params:
+                self.params['mid_period'] = min(40, self.params.get('mid_period', 20) + 5)
+            if 'stop_loss_pct' in self.params:
+                self.params['stop_loss_pct'] = max(0.05, self.params.get('stop_loss_pct', 0.08) - 0.02)
+
+        logger.debug(f"参数自适应: 波动率{recent_vol:.2%}({vol_level}), 参数已调整")

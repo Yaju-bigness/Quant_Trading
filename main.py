@@ -4,6 +4,7 @@
 """
 import argparse
 from datetime import datetime, timedelta
+from typing import Dict
 from loguru import logger
 
 from config.config import STOCKS, TRADING_CONFIG, BACKTEST_CONFIG, RISK_CONFIG
@@ -17,9 +18,12 @@ from strategy.sentiment import (
     NewsSentimentStrategy, MoneyFlowStrategy,
     CompositeSentimentStrategy
 )
+from strategy.intraday import (
+    IntradayVolumePriceStrategy, RSIMeanReversionStrategy
+)
 from backtest.engine import BacktestEngine
 from trade.executor import PaperTrader, LiveTradingEngine, create_trader
-from analysis.analyzer import TechnicalAnalyzer, ReportGenerator
+from analysis.analyzer import TechnicalAnalyzer, ReportGenerator, MarketAnalyzer
 from analysis.html_report import HTMLReportGenerator
 from analysis.performance import PerformanceAnalyzer
 from risk.manager import RiskManager, RiskConfig
@@ -45,6 +49,8 @@ def run_backtest(args):
         'kdj': KDJStrategy(),
         'boll': BollingerStrategy(),
         'composite': CompositeStrategy(),
+        'intraday_vp': IntradayVolumePriceStrategy(),
+        'rsi_mr': RSIMeanReversionStrategy(),
     }
 
     if args.compare:
@@ -125,6 +131,7 @@ def run_analysis(args):
     logger.info("开始数据分析...")
 
     analyzer = TechnicalAnalyzer()
+    market_analyzer = MarketAnalyzer()
 
     # 默认日期为近一个月
     end_date = args.end or datetime.now().strftime('%Y-%m-%d')
@@ -151,6 +158,14 @@ def run_analysis(args):
             if analysis:
                 print(analyzer.generate_report(analysis))
 
+            # 今日交易量分析
+            if args.today_volume:
+                print("\n" + "="*60)
+                print("【今日交易量分析】")
+                print("="*60)
+                volume_analysis = market_analyzer.analyze_today_volume(stock_code)
+                print_volume_report(volume_analysis)
+
             # 弹出图表
             analyzer.plot_analysis(
                 stock_code, stock_name,
@@ -163,6 +178,143 @@ def run_analysis(args):
             logger.info(f"分析 {name} ({code})")
             analysis = analyzer.analyze_stock(code, start_date, end_date)
             print(analyzer.generate_report(analysis))
+
+
+def run_market_analysis(args):
+    """运行市场分析"""
+    logger.info("开始市场分析...")
+
+    market_analyzer = MarketAnalyzer()
+
+    # 大盘情绪分析
+    if args.market or args.all:
+        print("\n" + "="*60)
+        print("【大盘情绪分析】")
+        print("="*60)
+        market_result = market_analyzer.analyze_market_overview()
+        print_market_report(market_result)
+
+    # 板块情绪分析
+    if args.sector or args.all:
+        print("\n" + "="*60)
+        print("【板块情绪分析】")
+        print("="*60)
+        sector_result = market_analyzer.analyze_sector_sentiment(top_n=args.top or 10)
+        print_sector_report(sector_result)
+
+    # 今日交易量分析（针对特定股票）
+    if args.volume and args.stock:
+        print("\n" + "="*60)
+        print("【今日交易量分析】")
+        print("="*60)
+        volume_result = market_analyzer.analyze_today_volume(args.stock)
+        print_volume_report(volume_result)
+
+    # 如果没有指定任何分析，默认执行全部
+    if not (args.market or args.sector or args.volume or args.all):
+        print("\n" + "="*60)
+        print("【大盘情绪分析】")
+        print("="*60)
+        market_result = market_analyzer.analyze_market_overview()
+        print_market_report(market_result)
+
+        print("\n" + "="*60)
+        print("【板块情绪分析】")
+        print("="*60)
+        sector_result = market_analyzer.analyze_sector_sentiment(top_n=10)
+        print_sector_report(sector_result)
+
+
+def print_volume_report(volume_analysis: Dict):
+    """打印交易量分析报告"""
+    if not volume_analysis:
+        print("无法获取交易量数据")
+        return
+
+    if 'status' in volume_analysis and volume_analysis.get('status') in ['数据不足', '分析失败']:
+        print(f"分析状态: {volume_analysis['status']}")
+        return
+
+    print(f"成交量: {volume_analysis.get('volume', 0):,.0f}")
+    print(f"成交额: {volume_analysis.get('amount', 0):,.2f}")
+    print(f"量比: {volume_analysis.get('volume_ratio', 0):.2f}")
+    print(f"5日均量: {volume_analysis.get('vol_ma5', 0):,.0f}")
+    print(f"10日均量: {volume_analysis.get('vol_ma10', 0):,.0f}")
+    print(f"20日均量: {volume_analysis.get('vol_ma20', 0):,.0f}")
+    if volume_analysis.get('turnover'):
+        print(f"换手率: {volume_analysis.get('turnover', 0):.2f}%")
+    print(f"量能状态: {volume_analysis.get('volume_status', '未知')}")
+    print(f"涨跌幅: {volume_analysis.get('price_change_pct', 0):.2f}%")
+    print(f"价量配合: {volume_analysis.get('price_volume_status', '未知')}")
+    print(f"分析建议: {volume_analysis.get('suggestion', '')}")
+
+
+def print_market_report(market_result: Dict):
+    """打印大盘分析报告"""
+    if not market_result:
+        print("无法获取大盘数据")
+        return
+
+    # 打印指数数据
+    if market_result.get('indices'):
+        print("\n主要指数:")
+        for code, data in market_result['indices'].items():
+            pct = data.get('pct_change', 0)
+            pct_str = f"+{pct:.2f}%" if pct >= 0 else f"{pct:.2f}%"
+            print(f"  {data.get('name', code)}: {data.get('price', 0):.2f} ({pct_str})")
+
+    # 打印市场宽度
+    if market_result.get('market_breadth'):
+        breadth = market_result['market_breadth']
+        total = breadth.get('total', 0)
+        up = breadth.get('up', 0)
+        down = breadth.get('down', 0)
+        flat = breadth.get('flat', 0)
+        limit_up = breadth.get('limit_up', 0)
+        limit_down = breadth.get('limit_down', 0)
+
+        print(f"\n市场宽度:")
+        print(f"  上涨: {up} ({breadth.get('up_ratio', 0)*100:.1f}%)")
+        print(f"  下跌: {down} ({breadth.get('down_ratio', 0)*100:.1f}%)")
+        print(f"  平盘: {flat}")
+        print(f"  涨停: {limit_up}")
+        print(f"  跌停: {limit_down}")
+
+    print(f"\n市场情绪: {market_result.get('sentiment', '未知')}")
+    print(f"情绪得分: {market_result.get('score', 0)}")
+    print(f"操作建议: {market_result.get('suggestion', '')}")
+
+
+def print_sector_report(sector_result: Dict):
+    """打印板块分析报告"""
+    if not sector_result:
+        print("无法获取板块数据")
+        return
+
+    # 打印热门板块
+    if sector_result.get('hot_sectors'):
+        print("\n热门板块 TOP5:")
+        for i, sector in enumerate(sector_result['hot_sectors'][:5], 1):
+            pct = sector.get('pct_change', 0)
+            if isinstance(pct, str):
+                pct = float(pct.replace('%', ''))
+            pct_str = f"+{pct:.2f}%" if pct >= 0 else f"{pct:.2f}%"
+            leading = sector.get('leading_stock', '')
+            print(f"  {i}. {sector.get('name', '')}: {pct_str} (领涨: {leading})")
+
+    # 打印弱势板块
+    if sector_result.get('weak_sectors'):
+        print("\n弱势板块 TOP5:")
+        for i, sector in enumerate(sector_result['weak_sectors'][:5], 1):
+            pct = sector.get('pct_change', 0)
+            if isinstance(pct, str):
+                pct = float(pct.replace('%', ''))
+            pct_str = f"+{pct:.2f}%" if pct >= 0 else f"{pct:.2f}%"
+            print(f"  {i}. {sector.get('name', '')}: {pct_str}")
+
+    print(f"\n板块情绪: {sector_result.get('sentiment', '未知')}")
+    print(f"情绪得分: {sector_result.get('score', 0)}")
+    print(f"操作建议: {sector_result.get('suggestion', '')}")
 
 
 def run_html_report(args):
@@ -222,21 +374,23 @@ def run_optimize(args):
         'kdj': KDJStrategy,
         'boll': BollingerStrategy,
         'composite': CompositeStrategy,
+        'intraday_vp': IntradayVolumePriceStrategy,
+        'rsi_mr': RSIMeanReversionStrategy,
     }
     strategy_class = strategy_map.get(args.strategy, MAStrategy)
 
-    # 定义参数网格
+    # 定义参数网格（使用A股合理参数区间）
     if args.strategy == 'ma':
         param_grid = {
-            'short_period': [5, 10, 15],
-            'mid_period': [20, 30, 40],
-            'long_period': [60, 80, 100],
+            'short_period': [3, 5, 8, 10],
+            'mid_period': [15, 20, 30],
+            'long_period': [40, 60, 80, 120],
         }
     elif args.strategy == 'macd':
         param_grid = {
-            'fast': [8, 10, 12, 14],
-            'slow': [20, 24, 26, 30],
-            'signal': [7, 9, 11],
+            'fast': [6, 8, 10, 12],
+            'slow': [19, 21, 24, 26],
+            'signal': [5, 7, 9, 12],
         }
     elif args.strategy == 'kdj':
         param_grid = {
@@ -246,8 +400,20 @@ def run_optimize(args):
         }
     elif args.strategy == 'boll':
         param_grid = {
-            'period': [15, 20, 25],
+            'period': [10, 15, 20, 25],
             'std_dev': [1.5, 2.0, 2.5],
+        }
+    elif args.strategy == 'intraday_vp':
+        param_grid = {
+            'volume_ratio_threshold': [1.2, 1.5, 1.8, 2.0],
+            'lookback_days': [3, 5, 7],
+            'breakout_pct': [0.003, 0.005, 0.008],
+        }
+    elif args.strategy == 'rsi_mr':
+        param_grid = {
+            'rsi_oversold': [15, 20, 25],
+            'rsi_overbought': [75, 80, 85],
+            'boll_position_threshold': [0.10, 0.15, 0.20],
         }
     else:
         param_grid = {
@@ -365,7 +531,7 @@ def main():
     backtest_parser = subparsers.add_parser('backtest', help='运行回测')
     backtest_parser.add_argument('--stock', '-s', help='股票代码')
     backtest_parser.add_argument('--name', '-n', help='股票名称')
-    backtest_parser.add_argument('--strategy', choices=['ma', 'macd', 'kdj', 'boll', 'composite', 'all'],
+    backtest_parser.add_argument('--strategy', choices=['ma', 'macd', 'kdj', 'boll', 'composite', 'intraday_vp', 'rsi_mr', 'all'],
                                 default='composite', help='选择策略')
     backtest_parser.add_argument('--start', help='开始日期 YYYY-MM-DD')
     backtest_parser.add_argument('--end', help='结束日期 YYYY-MM-DD')
@@ -388,6 +554,8 @@ def main():
     analysis_parser.add_argument('--output', '-o', help='保存图表路径')
     analysis_parser.add_argument('--html', nargs='?', const=True, default=False,
                                 help='生成HTML报告（可指定文件名）')
+    analysis_parser.add_argument('--today-volume', action='store_true',
+                                help='分析今日交易量')
 
     # HTML报告命令
     html_parser = subparsers.add_parser('html', help='生成HTML分析报告')
@@ -405,7 +573,7 @@ def main():
     optimize_parser = subparsers.add_parser('optimize', help='策略参数优化')
     optimize_parser.add_argument('--stock', '-s', help='股票代码')
     optimize_parser.add_argument('--name', '-n', help='股票名称')
-    optimize_parser.add_argument('--strategy', choices=['ma', 'macd', 'kdj', 'boll', 'composite'],
+    optimize_parser.add_argument('--strategy', choices=['ma', 'macd', 'kdj', 'boll', 'composite', 'intraday_vp', 'rsi_mr'],
                                 default='ma', help='选择策略')
     optimize_parser.add_argument('--method', choices=['grid', 'genetic'],
                                 default='grid', help='优化方法')
@@ -421,6 +589,15 @@ def main():
     cache_parser.add_argument('--stats', action='store_true', help='查看缓存统计')
     cache_parser.add_argument('--preload', action='store_true', help='预加载数据')
 
+    # 市场分析命令
+    market_parser = subparsers.add_parser('market', help='市场分析（大盘/板块情绪）')
+    market_parser.add_argument('--market', '-m', action='store_true', help='大盘情绪分析')
+    market_parser.add_argument('--sector', '-s', action='store_true', help='板块情绪分析')
+    market_parser.add_argument('--volume', '-v', action='store_true', help='交易量分析（需配合--stock）')
+    market_parser.add_argument('--stock', help='股票代码（用于交易量分析）')
+    market_parser.add_argument('--all', '-a', action='store_true', help='执行全部市场分析')
+    market_parser.add_argument('--top', type=int, default=10, help='显示前N个热门/弱势板块')
+
     args = parser.parse_args()
 
     # 执行对应命令
@@ -430,6 +607,8 @@ def main():
         run_live(args)
     elif args.command == 'analyze':
         run_analysis(args)
+    elif args.command == 'market':
+        run_market_analysis(args)
     elif args.command == 'html':
         run_html_report(args)
     elif args.command == 'report':

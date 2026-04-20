@@ -3,10 +3,14 @@
 """
 from risk.manager import (
     RiskManager, RiskConfig, StopLossManager, PositionSizer,
-    StopLossType, PositionRisk
+    StopLossType, PositionRisk,
+    AdaptiveATRStopLoss, TrailingTakeProfit,
+    EmergencyHandler, StrategyHealthMonitor
 )
 
 __all__ = [
     'RiskManager', 'RiskConfig', 'StopLossManager', 'PositionSizer',
-    'StopLossType', 'PositionRisk'
+    'StopLossType', 'PositionRisk',
+    'AdaptiveATRStopLoss', 'TrailingTakeProfit',
+    'EmergencyHandler', 'StrategyHealthMonitor'
 ]

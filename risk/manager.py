@@ -112,7 +112,8 @@ class StopLossManager:
 
     def update_trailing_stop(self, stock_code: str, current_price: float) -> Optional[float]:
         """
-        更新追踪止损
+        更新追踪止损（优化版：阶梯式追踪）
+        盈利5%后收紧到3%回撤，盈利10%后收紧到5%回撤
         :param stock_code: 股票代码
         :param current_price: 当前价格
         :return: 新止损价格（如果触发则返回None）
@@ -125,11 +126,26 @@ class StopLossManager:
         # 更新最高价
         if current_price > pos_risk.highest_price:
             pos_risk.highest_price = current_price
-            # 更新止损价格
-            new_stop = current_price * (1 - self.config.trailing_stop_pct)
-            if new_stop > pos_risk.stop_loss_price:
-                pos_risk.stop_loss_price = new_stop
-                logger.info(f"追踪止损更新: {stock_code} 新止损价 {new_stop:.2f}")
+
+        # 阶梯式追踪止损
+        profit_pct = (current_price - pos_risk.entry_price) / pos_risk.entry_price
+
+        if profit_pct > 0.10:
+            # 盈利10%以上：回撤5%触发
+            trail_pct = 0.05
+        elif profit_pct > 0.05:
+            # 盈利5%-10%：回撤3%触发
+            trail_pct = 0.03
+        else:
+            # 盈利5%以下：使用默认追踪止损
+            trail_pct = self.config.trailing_stop_pct
+
+        # 更新止损价格
+        new_stop = pos_risk.highest_price * (1 - trail_pct)
+        if new_stop > pos_risk.stop_loss_price:
+            pos_risk.stop_loss_price = new_stop
+            logger.info(f"追踪止损更新: {stock_code} 盈利{profit_pct*100:.1f}%, "
+                       f"回撤{trail_pct*100:.1f}%, 新止损价 {new_stop:.2f}")
 
         # 检查是否触发止损
         if current_price <= pos_risk.stop_loss_price:
@@ -350,6 +366,47 @@ class PositionSizer:
 
         return result
 
+    def dynamic_position(self, capital: float, price: float,
+                          stock_volatility: float = None,
+                          market_trend: str = 'neutral',
+                          **kwargs) -> int:
+        """
+        动态仓位调整：结合个股波动率和大盘状态
+        :param capital: 总资金
+        :param price: 当前价格
+        :param stock_volatility: 个股年化波动率
+        :param market_trend: 大盘趋势 'bull'(牛市)/'bear'(熊市)/'neutral'(震荡)
+        :return: 建议股数
+        """
+        # 基础仓位范围
+        min_pct = 0.15
+        max_pct = 0.25
+        base_pct = self.config.max_position_pct
+
+        # 大盘趋势调整
+        if market_trend == 'bull':
+            position_pct = min(max_pct, base_pct * 1.2)
+        elif market_trend == 'bear':
+            position_pct = max(min_pct, base_pct * 0.75)
+        else:
+            position_pct = base_pct
+
+        # 个股波动率调整
+        if stock_volatility is not None:
+            target_vol = 0.20  # 目标波动率20%
+            vol_ratio = target_vol / stock_volatility if stock_volatility > 0 else 1
+            # 波动率调整不超过±30%
+            vol_adjust = max(0.7, min(1.3, vol_ratio))
+            position_pct *= vol_adjust
+
+        # 限制在合理范围
+        position_pct = max(min_pct, min(max_pct, position_pct))
+
+        logger.info(f"动态仓位: 大盘{market_trend}, 波动率{stock_volatility or 'N/A'}, "
+                   f"仓位{position_pct*100:.1f}%")
+
+        return int(capital * position_pct / price / 100) * 100
+
 
 class RiskManager:
     """风险管理器 - 统一管理所有风险控制"""
@@ -500,3 +557,203 @@ if __name__ == '__main__':
     )
 
     print(risk_manager.get_risk_report(capital, {}))
+
+
+class AdaptiveATRStopLoss:
+    """ATR动态止损（波动率自适应）：高波动时ATR倍数增大，低波动时缩小"""
+
+    def __init__(self, atr_multiplier_range: Tuple[float, float] = (1.5, 2.5),
+                 lookback: int = 20):
+        """
+        :param atr_multiplier_range: ATR倍数范围 (低波动, 高波动)
+        :param lookback: ATR百分位回看天数
+        """
+        self.atr_multiplier_range = atr_multiplier_range
+        self.lookback = lookback
+
+    def calculate_stop_price(self, entry_price: float, atr: float,
+                              atr_history: List[float] = None) -> float:
+        """
+        计算自适应ATR止损价
+        :param entry_price: 入场价
+        :param atr: 当前ATR值
+        :param atr_history: 近期ATR序列（用于计算百分位）
+        """
+        if atr_history and len(atr_history) >= self.lookback:
+            # 计算ATR百分位
+            percentile = sum(1 for a in atr_history if a < atr) / len(atr_history)
+            # 高百分位(高波动)用大倍数，低百分位(低波动)用小倍数
+            low_mult, high_mult = self.atr_multiplier_range
+            multiplier = low_mult + (high_mult - low_mult) * percentile
+        else:
+            multiplier = sum(self.atr_multiplier_range) / 2  # 默认取中间值
+
+        stop_price = entry_price - multiplier * atr
+        logger.info(f"自适应ATR止损: 倍数{multiplier:.2f}, ATR={atr:.2f}, 止损价={stop_price:.2f}")
+        return stop_price
+
+
+class TrailingTakeProfit:
+    """移动止盈：跟随股价上涨调整止盈线，最高价回落N%触发止盈"""
+
+    def __init__(self, activation_pct: float = 0.05, trail_pct: float = 0.03):
+        """
+        :param activation_pct: 激活阈值（盈利百分比），如5%
+        :param trail_pct: 回撤触发比例，如3%
+        """
+        self.activation_pct = activation_pct
+        self.trail_pct = trail_pct
+
+    def check_take_profit(self, entry_price: float, current_price: float,
+                           highest_price: float) -> Tuple[bool, str]:
+        """
+        检查是否触发移动止盈
+        :return: (是否触发, 原因)
+        """
+        profit_pct = (current_price - entry_price) / entry_price
+
+        # 未达到激活阈值
+        if profit_pct < self.activation_pct:
+            return False, ""
+
+        # 计算从最高价的回撤
+        drawdown_from_peak = (highest_price - current_price) / highest_price
+
+        if drawdown_from_peak >= self.trail_pct:
+            return True, (f"移动止盈触发: 盈利{profit_pct*100:.1f}%, "
+                         f"从最高{highest_price:.2f}回落{drawdown_from_peak*100:.1f}%")
+
+        return False, ""
+
+
+class EmergencyHandler:
+    """极端行情应急处理"""
+
+    def __init__(self, market_drop_threshold: float = 0.03,
+                 limit_down_threshold: float = -0.095):
+        """
+        :param market_drop_threshold: 大盘暴跌阈值（单日跌幅），默认3%
+        :param limit_down_threshold: 跌停判断阈值，默认-9.5%
+        """
+        self.market_drop_threshold = market_drop_threshold
+        self.limit_down_threshold = limit_down_threshold
+        self.trading_paused = False
+        self.pause_reason = ""
+
+    def check_market_crash(self, index_pct_change: float) -> Tuple[bool, str]:
+        """检测大盘暴跌"""
+        if index_pct_change <= -self.market_drop_threshold * 100:
+            self.trading_paused = True
+            self.pause_reason = f"大盘暴跌{index_pct_change:.2f}%，暂停买入"
+            logger.warning(self.pause_reason)
+            return True, self.pause_reason
+        return False, ""
+
+    def check_limit_down(self, current_price: float, prev_close: float,
+                          stock_code: str) -> Tuple[bool, str]:
+        """检测个股跌停"""
+        if prev_close > 0:
+            pct_change = (current_price - prev_close) / prev_close
+            if pct_change <= self.limit_down_threshold:
+                # 创业板/科创板20%涨跌停
+                if stock_code.startswith('30') or stock_code.startswith('68'):
+                    if pct_change <= -0.195:
+                        return True, f"个股{stock_code}跌停({pct_change*100:.2f}%)"
+                else:
+                    return True, f"个股{stock_code}跌停({pct_change*100:.2f}%)"
+        return False, ""
+
+    def check_suspension(self, volume: float, stock_code: str) -> Tuple[bool, str]:
+        """检测停牌（成交量为0）"""
+        if volume == 0:
+            return True, f"个股{stock_code}疑似停牌(成交量为0)"
+        return False, ""
+
+    def should_allow_buy(self) -> Tuple[bool, str]:
+        """是否允许买入"""
+        if self.trading_paused:
+            return False, self.pause_reason
+        return True, ""
+
+    def resume_trading(self):
+        """恢复交易（需手动确认）"""
+        self.trading_paused = False
+        self.pause_reason = ""
+        logger.info("交易已恢复")
+
+
+class StrategyHealthMonitor:
+    """策略失效检测与自动切换"""
+
+    def __init__(self, max_consecutive_losses: int = 3,
+                 min_win_rate: float = 0.4,
+                 win_rate_window: int = 20,
+                 max_drawdown_pct: float = 0.15):
+        """
+        :param max_consecutive_losses: 最大连续亏损次数
+        :param min_win_rate: 最低胜率
+        :param win_rate_window: 胜率计算窗口
+        :param max_drawdown_pct: 最大回撤限制
+        """
+        self.max_consecutive_losses = max_consecutive_losses
+        self.min_win_rate = min_win_rate
+        self.win_rate_window = win_rate_window
+        self.max_drawdown_pct = max_drawdown_pct
+        self.consecutive_losses = 0
+        self.recent_trades: List[Dict] = []
+        self.strategy_paused = False
+        self.position_reduction = 1.0  # 仓位缩减系数
+
+    def record_trade(self, profit: float):
+        """记录交易结果"""
+        self.recent_trades.append({
+            'profit': profit,
+            'is_win': profit > 0
+        })
+
+        # 只保留最近N笔
+        if len(self.recent_trades) > self.win_rate_window:
+            self.recent_trades = self.recent_trades[-self.win_rate_window:]
+
+        # 更新连续亏损
+        if profit > 0:
+            self.consecutive_losses = 0
+        else:
+            self.consecutive_losses += 1
+
+        self._check_health()
+
+    def _check_health(self):
+        """检查策略健康状态"""
+        # 连续亏损检查
+        if self.consecutive_losses >= self.max_consecutive_losses:
+            self.position_reduction = 0.5  # 仓位减半
+            logger.warning(f"策略连续亏损{self.consecutive_losses}次，仓位缩减至50%")
+
+        # 胜率检查
+        if len(self.recent_trades) >= self.win_rate_window:
+            win_rate = sum(1 for t in self.recent_trades if t['is_win']) / len(self.recent_trades)
+            if win_rate < self.min_win_rate:
+                self.strategy_paused = True
+                logger.warning(f"策略胜率{win_rate*100:.1f}%低于阈值{self.min_win_rate*100:.1f}%，暂停策略")
+
+    def check_drawdown(self, current_drawdown: float):
+        """检查回撤"""
+        if current_drawdown > self.max_drawdown_pct:
+            self.strategy_paused = True
+            logger.warning(f"最大回撤{current_drawdown*100:.2f}%超限{self.max_drawdown_pct*100:.1f}%，暂停策略")
+
+    def get_position_multiplier(self) -> float:
+        """获取仓位调整系数"""
+        return self.position_reduction
+
+    def is_paused(self) -> bool:
+        """策略是否暂停"""
+        return self.strategy_paused
+
+    def reset(self):
+        """重置监控状态"""
+        self.consecutive_losses = 0
+        self.recent_trades = []
+        self.strategy_paused = False
+        self.position_reduction = 1.0

@@ -15,16 +15,30 @@ from pathlib import Path
 
 
 class DataCache:
-    """数据缓存管理器"""
+    """数据缓存管理器（支持LRU淘汰、内存上限、分类过期）"""
 
-    def __init__(self, cache_dir: str = None, expire_hours: int = 4):
+    # 缓存类型与默认过期时间（秒）
+    CACHE_EXPIRE = {
+        'kline': 4 * 3600,        # 日K线 4小时
+        'realtime': 30,            # 实时行情 30秒
+        'money_flow': 3600,        # 资金流向 1小时
+        'news': 1800,              # 新闻 30分钟
+        'default': 4 * 3600,       # 默认 4小时
+    }
+
+    def __init__(self, cache_dir: str = None, expire_hours: int = 4,
+                 max_memory_items: int = 100, max_memory_size_mb: float = 500):
         """
         :param cache_dir: 缓存目录
-        :param expire_hours: 缓存过期时间（小时）
+        :param expire_hours: 缓存过期时间（小时），仅用于向后兼容
+        :param max_memory_items: 内存缓存最大条目数
+        :param max_memory_size_mb: 内存缓存最大占用(MB)
         """
         self.cache_dir = Path(cache_dir or os.path.expanduser("~/.quant_trading/cache"))
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.expire_hours = expire_hours
+        self.max_memory_items = max_memory_items
+        self.max_memory_size_mb = max_memory_size_mb
         self.memory_cache: Dict[str, Tuple[datetime, any]] = {}
 
     def _get_cache_key(self, *args, **kwargs) -> str:
@@ -36,58 +50,100 @@ class DataCache:
         """获取缓存文件路径"""
         return self.cache_dir / f"{cache_key}.pkl"
 
-    def get(self, *args, **kwargs) -> Optional[any]:
+    def _get_expire_seconds(self, cache_type: str = None) -> float:
+        """根据缓存类型获取过期秒数"""
+        if cache_type and cache_type in self.CACHE_EXPIRE:
+            return self.CACHE_EXPIRE[cache_type]
+        return self.expire_hours * 3600
+
+    def _estimate_size_mb(self, data) -> float:
+        """估算数据占用内存(MB)"""
+        try:
+            import sys
+            return sys.getsizeof(data) / 1024 / 1024
+        except Exception:
+            return 0
+
+    def _evict_if_needed(self):
+        """当内存缓存超过限制时淘汰最早的条目"""
+        # 条目数超限
+        if len(self.memory_cache) > self.max_memory_items:
+            # 淘汰最早20%的条目
+            sorted_keys = sorted(self.memory_cache.keys(),
+                                 key=lambda k: self.memory_cache[k][0])
+            evict_count = max(1, len(sorted_keys) // 5)
+            for key in sorted_keys[:evict_count]:
+                del self.memory_cache[key]
+            logger.debug(f"内存缓存淘汰 {evict_count} 条(条目数超限)")
+
+        # 内存占用超限
+        total_size = sum(self._estimate_size_mb(v[1]) for v in self.memory_cache.values())
+        if total_size > self.max_memory_size_mb:
+            sorted_keys = sorted(self.memory_cache.keys(),
+                                 key=lambda k: self.memory_cache[k][0])
+            evict_count = max(1, len(sorted_keys) // 5)
+            for key in sorted_keys[:evict_count]:
+                del self.memory_cache[key]
+            logger.debug(f"内存缓存淘汰 {evict_count} 条(内存超限)")
+
+    def get(self, *args, cache_type: str = None, **kwargs) -> Optional[any]:
         """
         从缓存获取数据
+        :param cache_type: 缓存类型(kline/realtime/money_flow/news)
         :return: 缓存数据，不存在或过期返回None
         """
         cache_key = self._get_cache_key(*args, **kwargs)
+        expire_seconds = self._get_expire_seconds(cache_type)
 
         # 先检查内存缓存
         if cache_key in self.memory_cache:
             cache_time, data = self.memory_cache[cache_key]
-            if datetime.now() - cache_time < timedelta(hours=self.expire_hours):
+            if (datetime.now() - cache_time).total_seconds() < expire_seconds:
                 logger.debug(f"内存缓存命中: {cache_key[:8]}")
                 return data
             else:
                 del self.memory_cache[cache_key]
 
-        # 检查文件缓存
-        cache_path = self._get_cache_path(cache_key)
-        if cache_path.exists():
-            # 检查过期
-            file_time = datetime.fromtimestamp(cache_path.stat().st_mtime)
-            if datetime.now() - file_time < timedelta(hours=self.expire_hours):
-                try:
-                    with open(cache_path, 'rb') as f:
-                        data = pickle.load(f)
-                    # 同时缓存到内存
-                    self.memory_cache[cache_key] = (datetime.now(), data)
-                    logger.debug(f"文件缓存命中: {cache_key[:8]}")
-                    return data
-                except Exception as e:
-                    logger.warning(f"缓存读取失败: {e}")
-            else:
-                # 删除过期缓存
-                cache_path.unlink()
+        # 检查文件缓存（仅非实时数据使用文件缓存）
+        if cache_type != 'realtime':
+            cache_path = self._get_cache_path(cache_key)
+            if cache_path.exists():
+                file_time = datetime.fromtimestamp(cache_path.stat().st_mtime)
+                if (datetime.now() - file_time).total_seconds() < expire_seconds:
+                    try:
+                        with open(cache_path, 'rb') as f:
+                            data = pickle.load(f)
+                        # 同时缓存到内存
+                        self.memory_cache[cache_key] = (datetime.now(), data)
+                        logger.debug(f"文件缓存命中: {cache_key[:8]}")
+                        return data
+                    except Exception as e:
+                        logger.warning(f"缓存读取失败: {e}")
+                else:
+                    # 删除过期缓存
+                    cache_path.unlink()
 
         return None
 
-    def set(self, data: any, *args, **kwargs):
+    def set(self, data: any, *args, cache_type: str = None, **kwargs):
         """保存数据到缓存"""
         cache_key = self._get_cache_key(*args, **kwargs)
 
         # 保存到内存
         self.memory_cache[cache_key] = (datetime.now(), data)
 
-        # 保存到文件
-        cache_path = self._get_cache_path(cache_key)
-        try:
-            with open(cache_path, 'wb') as f:
-                pickle.dump(data, f)
-            logger.debug(f"数据已缓存: {cache_key[:8]}")
-        except Exception as e:
-            logger.warning(f"缓存写入失败: {e}")
+        # 淘汰检查
+        self._evict_if_needed()
+
+        # 保存到文件（实时数据不写文件缓存）
+        if cache_type != 'realtime':
+            cache_path = self._get_cache_path(cache_key)
+            try:
+                with open(cache_path, 'wb') as f:
+                    pickle.dump(data, f)
+                logger.debug(f"数据已缓存: {cache_key[:8]}")
+            except Exception as e:
+                logger.warning(f"缓存写入失败: {e}")
 
     def clear_memory(self):
         """清空内存缓存"""
@@ -101,14 +157,25 @@ class DataCache:
         logger.info("磁盘缓存已清空")
 
     def clear_expired(self):
-        """清理过期缓存"""
+        """清理过期缓存（内存+磁盘）"""
         cleared = 0
+        now = datetime.now()
+
+        # 清理内存缓存
+        expired_keys = []
+        for key, (cache_time, _) in self.memory_cache.items():
+            if (now - cache_time).total_seconds() > self.expire_hours * 3600:
+                expired_keys.append(key)
+        for key in expired_keys:
+            del self.memory_cache[key]
+
+        # 清理磁盘缓存
         for cache_file in self.cache_dir.glob("*.pkl"):
             file_time = datetime.fromtimestamp(cache_file.stat().st_mtime)
-            if datetime.now() - file_time >= timedelta(hours=self.expire_hours):
+            if now - file_time >= timedelta(hours=self.expire_hours):
                 cache_file.unlink()
                 cleared += 1
-        logger.info(f"清理过期缓存: {cleared} 个")
+        logger.info(f"清理过期缓存: 内存{len(expired_keys)}个, 磁盘{cleared}个")
 
     def get_cache_stats(self) -> Dict:
         """获取缓存统计"""
@@ -212,7 +279,7 @@ class DataValidator:
     @staticmethod
     def clean_kline(df: pd.DataFrame) -> pd.DataFrame:
         """
-        清洗K线数据
+        清洗K线数据（含异常值检测与自动修复）
         :return: 清洗后的DataFrame
         """
         df = df.copy()
@@ -238,7 +305,87 @@ class DataValidator:
         # 排序
         df = df.sort_values('date').reset_index(drop=True)
 
+        # 3σ异常值检测与修复
+        for col in ['close', 'volume']:
+            mean_val = df[col].mean()
+            std_val = df[col].std()
+            if std_val > 0:
+                lower = mean_val - 3 * std_val
+                upper = mean_val + 3 * std_val
+                outlier_mask = (df[col] < lower) | (df[col] > upper)
+                if outlier_mask.any():
+                    # 用中位数替换异常值
+                    median_val = df.loc[~outlier_mask, col].median()
+                    df.loc[outlier_mask, col] = median_val
+                    logger.info(f"列'{col}'修复{outlier_mask.sum()}个异常值(3σ)")
+
+        # 修复close导致的high/low不一致
+        df['high'] = df[['high', 'close', 'open']].max(axis=1)
+        df['low'] = df[['low', 'close', 'open']].min(axis=1)
+
         logger.info(f"数据清洗: 原始{len(df)}行 -> 清洗后{len(df)}行")
+
+        return df
+
+    @staticmethod
+    def detect_anomalies(df: pd.DataFrame, z_threshold: float = 3.0) -> Dict[str, List[int]]:
+        """
+        使用Z-score检测异常值
+        :param df: K线数据
+        :param z_threshold: Z-score阈值
+        :return: {列名: [异常行索引]}
+        """
+        anomalies = {}
+        for col in ['close', 'volume']:
+            if col not in df.columns:
+                continue
+            mean_val = df[col].mean()
+            std_val = df[col].std()
+            if std_val > 0:
+                z_scores = (df[col] - mean_val) / std_val
+                outlier_idx = df.index[z_scores.abs() > z_threshold].tolist()
+                if outlier_idx:
+                    anomalies[col] = outlier_idx
+        return anomalies
+
+    @staticmethod
+    def auto_repair(df: pd.DataFrame) -> pd.DataFrame:
+        """
+        自动修复缺失值和异常值
+        - 缺失值：线性插值填充
+        - 异常值(3σ外)：用相邻日中位数替换
+        """
+        df = df.copy()
+
+        # 修复缺失值
+        numeric_cols = ['open', 'high', 'low', 'close', 'volume']
+        for col in numeric_cols:
+            if col in df.columns:
+                missing = df[col].isna().sum()
+                if missing > 0:
+                    df[col] = df[col].interpolate(method='linear')
+                    # 首尾缺失用bfill/ffill
+                    df[col] = df[col].ffill().bfill()
+                    logger.info(f"列'{col}'插值修复{missing}个缺失值")
+
+        # 修复异常值
+        for col in ['close', 'volume']:
+            if col not in df.columns or len(df) < 5:
+                continue
+            mean_val = df[col].mean()
+            std_val = df[col].std()
+            if std_val > 0:
+                outlier_mask = (df[col] - mean_val).abs() > 3 * std_val
+                if outlier_mask.any():
+                    # 用滚动中位数替换
+                    rolling_median = df[col].rolling(window=5, center=True, min_periods=1).median()
+                    df.loc[outlier_mask, col] = rolling_median[outlier_mask]
+                    logger.info(f"列'{col}'异常值修复{outlier_mask.sum()}个")
+
+        # 修复价格一致性
+        if all(c in df.columns for c in ['open', 'high', 'low', 'close']):
+            df['high'] = df[['high', 'close', 'open']].max(axis=1)
+            df['low'] = df[['low', 'close', 'open']].min(axis=1)
 
         return df
 
@@ -291,7 +438,7 @@ class DataManager:
         """
         # 尝试从缓存获取
         if self.use_cache and not force_refresh:
-            cached = self.cache.get('kline', stock_code, start_date, end_date)
+            cached = self.cache.get('kline', stock_code, start_date, end_date, cache_type='kline')
             if cached is not None:
                 is_valid, errors = self.validator.validate_kline(cached)
                 if is_valid:
@@ -309,12 +456,14 @@ class DataManager:
         is_valid, errors = self.validator.validate_kline(df)
         if not is_valid:
             logger.warning(f"数据验证问题: {errors}")
+            # 尝试自动修复
+            df = self.validator.auto_repair(df)
             # 清洗数据
             df = self.validator.clean_kline(df)
 
         # 缓存
         if self.use_cache:
-            self.cache.set(df, 'kline', stock_code, start_date, end_date)
+            self.cache.set(df, 'kline', stock_code, start_date, end_date, cache_type='kline')
 
         return df
 

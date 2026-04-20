@@ -200,7 +200,7 @@ class NorthboundFlowStrategy(BaseStrategy):
 
     def generate_signals(self, data: pd.DataFrame) -> List[TradeSignal]:
         # 需要额外的北向资金数据
-        return signals
+        return []
 
     def calculate_position(self, capital: float, price: float,
                           signal: TradeSignal) -> int:

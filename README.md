@@ -11,11 +11,25 @@
 - **实盘交易**: 支持模拟盘和通达信实盘
 - **数据分析**: 技术分析、市场分析、HTML可视化报告
 
+### 市场分析功能
+- **今日交易量分析**: 量比计算、量能状态判断、价量配合分析
+- **大盘情绪分析**: 指数实时行情、涨跌家数统计、涨跌停统计、情绪评分
+- **板块情绪分析**: 行业板块排行、概念板块热点、板块涨跌统计
+
 ### 新增功能
 - **风险管理**: 止损止盈、追踪止损、ATR动态止损、仓位管理
 - **绩效分析**: 夏普比率、索提诺比率、卡玛比率、Alpha/Beta等15+指标
 - **参数优化**: 网格搜索、遗传算法、Walk-Forward验证
 - **数据缓存**: 内存+磁盘两级缓存，自动过期清理
+
+### 系统优化（v3.0）
+- **数据模块**: LRU缓存淘汰+内存上限、分类过期策略、异常检测与自动修复、数据源成功率统计与超时控制
+- **策略优化**: MA/MACD假信号过滤、综合策略加权打分、新增分时量价与RSI均值回归策略、参数自适应
+- **回测优化**: 信号索引查找加速、多标的组合回测、统计显著性检验
+- **风控强化**: ATR波动率自适应止损、阶梯追踪止损、移动止盈、极端行情应急、策略失效检测、仓位动态调整
+- **实盘优化**: 指令自动重试（3次/100ms）、防重复提交
+- **优化器增强**: A股合理参数区间、遗传算法自适应变异+锦标赛选择、Walk-Forward市场周期自适应
+- **可视化增强**: ECharts dataZoom交互、风险预警仪表盘、策略绩效对比报告
 
 ## 安装
 
@@ -57,12 +71,24 @@ RISK_CONFIG = {
     'stop_loss_pct': 0.08,          # 止损比例
     'take_profit_pct': 0.15,        # 止盈比例
     'trailing_stop_pct': 0.05,      # 追踪止损
+    # v3.0 新增
+    'min_position_pct': 0.15,       # 最低仓位(熊市)
+    'max_position_pct_dynamic': 0.25,  # 最高仓位(牛市)
+    'emergency_drop_threshold': 0.03,  # 大盘暴跌暂停阈值
+    'max_consecutive_losses': 3,    # 连续亏损暂停阈值
+    'min_win_rate': 0.4,           # 最低胜率
 }
 
 # 仓位管理配置
 POSITION_CONFIG = {
     'method': 'atr',                # fixed/kelly/atr/volatility
     'target_volatility': 0.15,      # 目标波动率
+}
+
+# 数据缓存配置（v3.0 新增）
+DATA_CONFIG = {
+    'max_memory_items': 100,        # 内存缓存最大条目数
+    'max_memory_size_mb': 500,      # 内存缓存最大占用(MB)
 }
 ```
 
@@ -76,6 +102,10 @@ python main.py backtest
 
 # 指定股票和策略
 python main.py backtest --stock 300308 --name 中际旭创 --strategy composite
+
+# 使用新增策略
+python main.py backtest --stock 300308 --strategy intraday_vp   # 分时量价策略
+python main.py backtest --stock 300308 --strategy rsi_mr        # RSI均值回归策略
 
 # 对比多个策略
 python main.py backtest --compare
@@ -132,23 +162,118 @@ python main.py analyze --stock 300308 --html report.html
 
 # 或使用专门的HTML命令
 python main.py html --stock 300308 --output 300308_report.html
+
+# 分析股票并包含今日交易量分析
+python main.py analyze --stock 300308 --today-volume
 ```
 
-### 4. 策略参数优化
+### 4. 市场分析
 
 ```bash
-# 网格搜索优化
+# 完整市场分析（大盘情绪 + 板块情绪）
+python main.py market --all
+
+# 只分析大盘情绪
+python main.py market --market
+# 或简写
+python main.py market -m
+
+# 只分析板块情绪
+python main.py market --sector
+# 或简写
+python main.py market -s
+
+# 分析板块情绪并显示TOP 5热门/弱势板块
+python main.py market -s --top 5
+
+# 分析某股票今日交易量
+python main.py market --volume --stock 300308
+# 或简写
+python main.py market -v --stock 300308
+```
+
+**市场分析输出示例**:
+```
+============================================================
+【大盘情绪分析】
+============================================================
+
+主要指数:
+  上证指数: 3250.50 (+0.85%)
+  深证成指: 10580.20 (+1.12%)
+  创业板指: 2150.30 (+1.35%)
+
+市场宽度:
+  上涨: 2850 (56.2%)
+  下跌: 1980 (39.0%)
+  平盘: 245
+  涨停: 65
+  跌停: 12
+
+市场情绪: 偏强
+情绪得分: 35
+操作建议: 市场情绪较好，可适度参与
+
+============================================================
+【板块情绪分析】
+============================================================
+
+热门板块 TOP5:
+  1. 人工智能: +3.25% (领涨: 某某科技)
+  2. 芯片: +2.85% (领涨: 某某电子)
+  3. 新能源汽车: +2.15% (领涨: 某某汽车)
+  4. 光伏: +1.95% (领涨: 某某光伏)
+  5. 储能: +1.82% (领涨: 某某能源)
+
+弱势板块 TOP5:
+  1. 房地产: -1.85%
+  2. 银行: -1.20%
+  3. 保险: -0.95%
+  4. 煤炭: -0.75%
+  5. 钢铁: -0.65%
+
+板块情绪: 偏强
+情绪得分: 25
+操作建议: 板块多数上涨，关注热点持续性
+```
+
+**今日交易量分析输出示例**:
+```
+============================================================
+【今日交易量分析】
+============================================================
+成交量: 12,580,000
+成交额: 456,280,000.00
+量比: 1.85
+5日均量: 6,800,000
+10日均量: 7,200,000
+20日均量: 6,500,000
+换手率: 3.25%
+量能状态: 放量
+涨跌幅: +2.35%
+价量配合: 价涨量增（健康）
+分析建议: 量价配合良好，上涨趋势健康
+```
+
+### 5. 策略参数优化
+
+```bash
+# 网格搜索优化（使用A股合理参数区间）
 python main.py optimize --strategy ma --method grid --scoring sharpe
 
-# 遗传算法优化
+# 遗传算法优化（种群80/迭代50，自适应变异+锦标赛选择）
 python main.py optimize --strategy macd --method genetic --scoring calmar
+
+# 优化新增策略
+python main.py optimize --strategy intraday_vp --method grid
+python main.py optimize --strategy rsi_mr --method genetic
 
 # 指定股票和日期
 python main.py optimize --strategy composite --stock 300308 \
     --start 2023-01-01 --end 2024-12-31 --output optimize_result.json
 ```
 
-### 5. 数据缓存管理
+### 6. 数据缓存管理
 
 ```bash
 # 查看缓存统计
@@ -161,7 +286,7 @@ python main.py cache --clear
 python main.py cache --preload
 ```
 
-### 6. 生成报告
+### 7. 生成报告
 
 ```bash
 python main.py report --output daily_report.txt
@@ -172,26 +297,29 @@ python main.py report --output daily_report.txt
 ```
 quant_trading/
 ├── config/               # 配置文件
-│   └── config.py         # 系统配置（风险、仓位、优化等）
+│   └── config.py         # 系统配置（风险、仓位、优化、缓存等）
 ├── data/                 # 数据获取模块
-│   ├── data_source.py    # 多数据源接口（8个备用源）
-│   └── data_manager.py   # 数据缓存、验证、清洗
+│   ├── data_source.py    # 多数据源接口（8个备用源）+ 成功率统计 + 超时控制
+│   └── data_manager.py   # 数据缓存（LRU淘汰+分类过期）、验证、异常检测与自动修复
 ├── strategy/             # 策略模块
-│   ├── base.py           # 策略基类
-│   ├── technical.py      # 技术指标策略
-│   └── sentiment.py      # 消息面策略
+│   ├── base.py           # 策略基类 + 参数自适应
+│   ├── technical.py      # 技术指标策略（MA/MACD/KDJ/布林/综合，含假信号过滤）
+│   ├── sentiment.py      # 消息面策略（新闻/资金/龙虎榜/北向）
+│   └── intraday.py       # 日内策略（分时量价突破/RSI均值回归）
 ├── backtest/             # 回测模块
-│   └── engine.py         # 回测引擎（集成风险管理和绩效分析）
+│   └── engine.py         # 回测引擎（信号索引加速 + 组合回测 + 显著性检验）
 ├── trade/                # 实盘交易模块
-│   └── executor.py       # 模拟盘/实盘交易执行器
+│   └── executor.py       # 模拟盘/实盘（指令重试 + 防重复提交）
 ├── analysis/             # 数据分析模块
-│   ├── analyzer.py       # 技术分析器
+│   ├── analyzer.py       # 技术分析器、市场分析器（大盘/板块情绪）
 │   ├── performance.py    # 绩效分析（15+指标）
-│   └── html_report.py    # HTML可视化报告
+│   └── html_report.py    # HTML可视化报告（dataZoom + 风险预警 + 策略对比）
 ├── risk/                 # 风险管理模块
-│   └── manager.py        # 止损止盈、仓位管理、风险控制
+│   └── manager.py        # 止损止盈、仓位管理、ATR自适应止损、移动止盈、
+│                         #   极端行情应急、策略失效检测、仓位动态调整
 ├── optimization/         # 参数优化模块
-│   └── optimizer.py      # 网格搜索、遗传算法、Walk-Forward
+│   └── optimizer.py      # 网格搜索、遗传算法（自适应变异+锦标赛）、
+│                         #   Walk-Forward（市场周期自适应）
 ├── utils/                # 工具函数
 └── main.py               # 主程序入口
 ```
@@ -200,13 +328,15 @@ quant_trading/
 
 ### 技术指标策略
 
-| 策略 | 说明 | 信号触发条件 |
-|------|------|--------------|
-| MA策略 | 均线金叉死叉 | 短期均线上穿/下穿中期均线 |
-| MACD策略 | MACD金叉死叉 | MACD与Signal线交叉，结合零轴判断 |
-| KDJ策略 | KDJ超买超卖 | K/D线在超卖/超买区金叉死叉 |
-| 布林带策略 | 价格触及上下轨 | 价格触及布林带边界反弹或突破 |
-| 综合策略 | 多指标共振 | MA、MACD、RSI、KDJ多指标确认 |
+| 策略 | 命令选项 | 说明 | 信号触发条件 |
+|------|----------|------|--------------|
+| MA策略 | `ma` | 均线金叉死叉 | 短期均线上穿/下穿中期均线，成交量+RSI过滤假信号 |
+| MACD策略 | `macd` | MACD金叉死叉 | MACD与Signal线交叉，零轴判断+柱状图确认+背离检测 |
+| KDJ策略 | `kdj` | KDJ超买超卖 | K/D线在超卖/超买区金叉死叉 |
+| 布林带策略 | `boll` | 价格触及上下轨 | 价格触及布林带边界反弹或突破 |
+| 综合策略 | `composite` | 多指标加权共振 | MA(30%)+MACD(25%)+RSI(20%)+KDJ(25%)加权打分 |
+| 分时量价策略 | `intraday_vp` | 量价突破 | 放量突破前日高点买入，跌破前日低点卖出，均线趋势过滤 |
+| RSI均值回归策略 | `rsi_mr` | 超买超卖回归 | RSI<20+布林下轨+MA20上方买入，RSI>80+布林上轨+MA20下方卖出 |
 
 ### 消息面策略
 
@@ -236,10 +366,74 @@ stop_price = risk_manager.stop_loss_manager.calculate_stop_loss(
     entry_price=100, stop_type=StopLossType.ATR, atr=3.5
 )  # 止损价: 93 (2倍ATR)
 
-# 追踪止损（持续更新）
+# 追踪止损（阶梯式：盈利5%后3%回撤，盈利10%后5%回撤）
 risk_manager.stop_loss_manager.add_position(
     '300308', '中际旭创', 100, 100, StopLossType.TRAILING
 )
+```
+
+### ATR波动率自适应止损（v3.0）
+
+```python
+from risk import AdaptiveATRStopLoss
+
+atr_stop = AdaptiveATRStopLoss(atr_multiplier_range=(1.5, 2.5))
+# 高波动时ATR倍数增大(2.5x)，低波动时缩小(1.5x)
+stop_price = atr_stop.calculate_stop_price(
+    entry_price=100, atr=3.5, atr_history=[2.0, 2.5, 3.0, 3.5, 4.0]
+)
+```
+
+### 移动止盈（v3.0）
+
+```python
+from risk import TrailingTakeProfit
+
+tp = TrailingTakeProfit(activation_pct=0.05, trail_pct=0.03)
+# 盈利5%后激活，最高价回落3%触发止盈
+triggered, reason = tp.check_take_profit(
+    entry_price=100, current_price=108, highest_price=112
+)
+```
+
+### 极端行情应急处理（v3.0）
+
+```python
+from risk import EmergencyHandler
+
+emergency = EmergencyHandler(market_drop_threshold=0.03)
+
+# 大盘暴跌检测（单日跌幅>=3%自动暂停买入）
+crash, reason = emergency.check_market_crash(-4.5)
+
+# 个股跌停检测
+limit_down, reason = emergency.check_limit_down(
+    current_price=90.5, prev_close=100, stock_code='300308'
+)
+
+# 检查是否允许买入
+allow, reason = emergency.should_allow_buy()
+```
+
+### 策略失效检测（v3.0）
+
+```python
+from risk import StrategyHealthMonitor
+
+monitor = StrategyHealthMonitor(
+    max_consecutive_losses=3,  # 连续3次亏损触发
+    min_win_rate=0.4,          # 最低胜率40%
+    win_rate_window=20         # 近20笔交易计算
+)
+
+# 记录每笔交易结果
+monitor.record_trade(profit=0.05)    # 盈利
+monitor.record_trade(profit=-0.03)   # 亏损
+
+# 连续亏损3次 → 仓位缩减至50%
+# 近20笔胜率<40% → 自动暂停策略
+print(f"仓位系数: {monitor.get_position_multiplier()}")  # 0.5 或 1.0
+print(f"策略暂停: {monitor.is_paused()}")
 ```
 
 ### 仓位管理
@@ -265,6 +459,13 @@ shares = sizer.atr_based(capital=100000, price=50, atr=1.5)
 shares = sizer.volatility_parity(
     capital=100000, price=50, volatility=0.25
 )
+
+# 动态仓位调整（v3.0）：结合个股波动率和大盘趋势
+shares = sizer.dynamic_position(
+    capital=100000, price=50,
+    stock_volatility=0.25,        # 个股年化波动率
+    market_trend='bull'           # bull/bear/neutral
+)  # 牛市0.25, 熊市0.15, 震荡0.20
 ```
 
 ## 绩效分析指标
@@ -280,14 +481,15 @@ shares = sizer.volatility_parity(
 
 ## 参数优化
 
-### 网格搜索
+### 网格搜索（使用A股合理参数区间）
 ```python
 from optimization import GridSearchOptimizer
 
+# A股合理参数区间（v3.0）
 param_grid = {
-    'short_period': [5, 10, 15],
-    'mid_period': [20, 30, 40],
-    'long_period': [60, 80, 100],
+    'short_period': [3, 5, 8, 10],
+    'mid_period': [15, 20, 30],
+    'long_period': [40, 60, 80, 120],
 }
 
 optimizer = GridSearchOptimizer(MAStrategy, param_grid, scoring='sharpe')
@@ -297,28 +499,33 @@ print(f"最佳参数: {result.best_params}")
 print(f"最佳夏普比率: {result.best_score}")
 ```
 
-### 遗传算法
+### 遗传算法（自适应变异+锦标赛选择）
 ```python
 from optimization import GeneticOptimizer
 
 param_bounds = {
-    'short_period': (5, 15),
-    'mid_period': (20, 40),
-    'long_period': (60, 100),
+    'short_period': (3, 10),
+    'mid_period': (15, 30),
+    'long_period': (40, 120),
 }
 
 optimizer = GeneticOptimizer(
     MAStrategy, param_bounds,
-    population_size=50, generations=30
+    population_size=80,      # v3.0: 50→80
+    generations=50,          # v3.0: 30→50
+    tournament_size=3        # v3.0: 锦标赛选择替代轮盘赌
 )
+# 自适应变异率: 前期0.2(探索) → 后期0.05(收敛)
 result = optimizer.optimize(backtest_func, data, stock_code, stock_name)
 ```
 
-### Walk-Forward验证
+### Walk-Forward验证（市场周期自适应）
 ```python
 from optimization import WalkForwardOptimizer
 
 wf_optimizer = WalkForwardOptimizer(in_sample_ratio=0.7, n_splits=5)
+# v3.0: 自动检测市场周期(牛市/震荡/熊市)
+#   牛市训练集比例0.6，震荡市0.7，熊市0.8
 summary = wf_optimizer.optimize(
     MAStrategy, param_grid, backtest_func, data, stock_code, stock_name
 )
@@ -332,11 +539,32 @@ print(f"参数稳定性: {summary['param_stability']}")
 生成的HTML报告包含：
 
 - **技术面分析**: K线图、均线、MACD、RSI、KDJ、成交量
+- **风险预警**: 综合风险评分仪表盘、RSI/波动率/布林带/KDJ风险提示（v3.0）
 - **消息面分析**: 新闻情绪、资金流向
 - **操作建议**: 综合评分、买入/卖出建议
-- **可视化图表**: ECharts交互式图表，支持缩放、hover
+- **可视化图表**: ECharts交互式图表，支持dataZoom缩放、hover
 
 颜色遵循中国股市惯例：**红涨绿跌**
+
+### 策略绩效对比报告（v3.0）
+
+```python
+from analysis.html_report import HTMLReportGenerator
+
+generator = HTMLReportGenerator()
+
+# 为多个策略生成对比报告
+strategy_results = {
+    'MA策略': ma_report,
+    'MACD策略': macd_report,
+    '综合策略': composite_report,
+}
+generator.generate_comparison_report(
+    strategy_results, stock_name='中际旭创',
+    output_path='comparison_report.html'
+)
+# 包含：净值曲线叠加对比 + 雷达图多维指标对比 + 指标对比表
+```
 
 ## 风险提示
 
@@ -350,12 +578,32 @@ print(f"参数稳定性: {summary['param_stability']}")
 
 1. [ ] 添加更多因子策略（动量、价值、质量等）
 2. [ ] 机器学习策略（LSTM、Transformer）
-3. [ ] 多标的组合回测和优化
-4. [ ] 实时风控预警系统
-5. [ ] Web可视化Dashboard
-6. [ ] 策略实盘监控系统
+3. [ ] Web可视化Dashboard
+4. [ ] 策略实盘监控系统
+5. [ ] 期货/期权多品种支持
 
 ## 更新日志
+
+### v3.0.0 (2026-04)
+- **数据模块优化**: LRU缓存淘汰+内存上限、分类过期策略(日K线4h/实时30s/资金流向1h)、3σ异常检测与自动修复、数据源成功率统计与超时控制
+- **策略优化**: MA策略增加成交量+RSI假信号过滤、MACD策略增加背离检测和短线参数(8,21,5)、综合策略改为加权打分制(MA30%/MACD25%/RSI20%/KDJ25%)
+- **新增策略**: 分时量价突破策略(`intraday_vp`)、RSI均值回归策略(`rsi_mr`)
+- **策略参数自适应**: 根据市场波动率自动调整均线周期和止损范围
+- **回测优化**: 信号日期索引查找(替代遍历)、多标的组合回测(`run_portfolio_backtest`)、统计显著性检验(t检验+Bootstrap)
+- **风控强化**: ATR波动率自适应止损(`AdaptiveATRStopLoss`)、阶梯追踪止损(盈利5%→3%回撤/盈利10%→5%回撤)、移动止盈(`TrailingTakeProfit`)、极端行情应急处理(`EmergencyHandler`)、策略失效检测(`StrategyHealthMonitor`)、仓位动态调整(大盘趋势+个股波动率自适应0.15-0.25)
+- **实盘优化**: 交易指令自动重试(最多3次/100ms)、防重复提交(5秒内同标的不重复)
+- **优化器增强**: A股合理参数区间建议、遗传算法种群80/迭代50、自适应变异率(0.2→0.05)、锦标赛选择替代轮盘赌、Walk-Forward市场周期自适应(牛市0.6/震荡0.7/熊市0.8)
+- **可视化增强**: ECharts dataZoom交互缩放、风险预警仪表盘(评分0-100)、策略绩效对比报告(净值曲线+雷达图)
+- **Bug修复**: `NorthboundFlowStrategy.generate_signals`未定义变量、`analyzer.py`缺少akshare导入
+
+## 更新日志
+
+### v2.1.0 (2025-04)
+- 新增市场分析命令 (`market`)
+- 新增今日交易量分析（量比、量能状态、价量配合）
+- 新增大盘情绪分析（指数行情、涨跌统计、情绪评分）
+- 新增板块情绪分析（行业/概念板块排行、热点追踪）
+- 新增数据源接口（指数实时行情、板块数据、市场概览）
 
 ### v2.0.0 (2024-04)
 - 新增风险管理模块（止损止盈、仓位管理）

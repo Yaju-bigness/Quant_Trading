@@ -126,34 +126,62 @@ class GridSearchOptimizer:
 
 
 class GeneticOptimizer:
-    """遗传算法优化器"""
+    """遗传算法优化器（优化版：自适应变异+锦标赛选择）"""
+
+    # A股合理参数区间建议
+    A_STOCK_PARAM_SUGGESTIONS = {
+        'ma': {
+            'short_period': [3, 5, 8, 10],
+            'mid_period': [15, 20, 30],
+            'long_period': [40, 60, 80, 120],
+        },
+        'macd': {
+            'fast': [6, 8, 10, 12],
+            'slow': [19, 21, 24, 26],
+            'signal': [5, 7, 9, 12],
+        },
+        'kdj': {
+            'n': [7, 9, 11, 14],
+            'm1': [2, 3, 4],
+            'm2': [2, 3, 4],
+        },
+        'boll': {
+            'period': [10, 15, 20, 25],
+            'std_dev': [1.5, 2.0, 2.5],
+        },
+    }
 
     def __init__(self,
                  strategy_class,
                  param_bounds: Dict[str, Tuple],
                  scoring: str = 'sharpe',
-                 population_size: int = 50,
-                 generations: int = 30,
+                 population_size: int = 80,
+                 generations: int = 50,
                  mutation_rate: float = 0.1,
                  crossover_rate: float = 0.7,
-                 elite_size: int = 5):
+                 elite_size: int = 5,
+                 tournament_size: int = 3):
         """
         :param strategy_class: 策略类
         :param param_bounds: 参数范围 {'param_name': (min, max)}
-        :param population_size: 种群大小
-        :param generations: 迭代代数
-        :param mutation_rate: 变异率
+        :param scoring: 评分指标
+        :param population_size: 种群大小(默认80，优化自50)
+        :param generations: 迭代代数(默认50，优化自30)
+        :param mutation_rate: 初始变异率(自适应调整)
         :param crossover_rate: 交叉率
         :param elite_size: 精英保留数量
+        :param tournament_size: 锦标赛选择大小
         """
         self.strategy_class = strategy_class
         self.param_bounds = param_bounds
         self.scoring = scoring
         self.population_size = population_size
         self.generations = generations
+        self.initial_mutation_rate = mutation_rate
         self.mutation_rate = mutation_rate
         self.crossover_rate = crossover_rate
         self.elite_size = elite_size
+        self.tournament_size = tournament_size
 
     def optimize(self,
                 backtest_func: Callable,
@@ -189,8 +217,13 @@ class GeneticOptimizer:
             if gen % 5 == 0:
                 logger.info(f"第 {gen} 代，最佳得分: {best_score:.4f}")
 
-            # 选择
-            selected = self._selection(population, fitness_scores)
+            # 自适应变异率：前期高变异，后期低变异
+            progress = gen / self.generations
+            self.mutation_rate = self.initial_mutation_rate * (1 - progress * 0.75)
+            self.mutation_rate = max(0.05, self.mutation_rate)  # 最低0.05
+
+            # 选择（锦标赛选择替代轮盘赌）
+            selected = self._tournament_selection(population, fitness_scores)
 
             # 交叉
             offspring = self._crossover(selected)
@@ -265,7 +298,7 @@ class GeneticOptimizer:
             return {'params': individual.copy(), 'score': -999, 'report': None}
 
     def _selection(self, population: List[Dict], fitness: List[float]) -> List[Dict]:
-        """轮盘赌选择"""
+        """轮盘赌选择（保留兼容）"""
         # 将负数转换为正数
         fitness = np.array(fitness)
         fitness = fitness - fitness.min() + 1e-6
@@ -278,6 +311,25 @@ class GeneticOptimizer:
             p=probs
         )
         return [population[i].copy() for i in selected_idx]
+
+    def _tournament_selection(self, population: List[Dict],
+                               fitness: List[float]) -> List[Dict]:
+        """锦标赛选择（避免早熟收敛）"""
+        selected = []
+        fitness_arr = np.array(fitness)
+        n_select = self.population_size - self.elite_size
+
+        for _ in range(n_select):
+            # 随机选择tournament_size个个体
+            candidates_idx = np.random.choice(
+                len(population), size=min(self.tournament_size, len(population)),
+                replace=False
+            )
+            # 选择适应度最高的
+            best_idx = candidates_idx[np.argmax(fitness_arr[candidates_idx])]
+            selected.append(population[best_idx].copy())
+
+        return selected
 
     def _crossover(self, population: List[Dict]) -> List[Dict]:
         """交叉操作"""
@@ -321,20 +373,56 @@ class GeneticOptimizer:
 
 
 class WalkForwardOptimizer:
-    """Walk-Forward验证优化器"""
+    """Walk-Forward验证优化器（优化版：自适应市场周期检测）"""
 
     def __init__(self,
                  in_sample_ratio: float = 0.7,
                  n_splits: int = 5,
                  optimization_method: str = 'grid'):
         """
-        :param in_sample_ratio: 样本内比例
+        :param in_sample_ratio: 样本内比例（会根据市场周期自适应调整）
         :param n_splits: 分割次数
         :param optimization_method: 优化方法 (grid, genetic)
         """
         self.in_sample_ratio = in_sample_ratio
         self.n_splits = n_splits
         self.optimization_method = optimization_method
+
+    def _detect_market_cycle(self, data: pd.DataFrame) -> str:
+        """
+        根据MA趋势判断市场周期
+        :return: 'bull'(牛市)/'bear'(熊市)/'neutral'(震荡)
+        """
+        if 'close' not in data.columns or len(data) < 60:
+            return 'neutral'
+
+        close = data['close']
+        ma20 = close.rolling(20).mean()
+        ma60 = close.rolling(60).mean()
+
+        if pd.isna(ma60.iloc[-1]) or pd.isna(ma20.iloc[-1]):
+            return 'neutral'
+
+        # 近20日趋势
+        recent_trend = (close.iloc[-1] - close.iloc[-20]) / close.iloc[-20]
+
+        # MA20 > MA60 且上涨趋势 > 5%
+        if ma20.iloc[-1] > ma60.iloc[-1] and recent_trend > 0.05:
+            return 'bull'
+        # MA20 < MA60 且下跌趋势 > 5%
+        elif ma20.iloc[-1] < ma60.iloc[-1] and recent_trend < -0.05:
+            return 'bear'
+        else:
+            return 'neutral'
+
+    def _adaptive_in_sample_ratio(self, market_cycle: str) -> float:
+        """根据市场周期调整训练集比例"""
+        if market_cycle == 'bull':
+            return 0.6  # 牛市减少训练比例
+        elif market_cycle == 'bear':
+            return 0.8  # 熊市增加训练比例
+        else:
+            return 0.7  # 震荡市默认
 
     def optimize(self,
                 strategy_class,
@@ -357,9 +445,14 @@ class WalkForwardOptimizer:
         all_params = []
 
         for i in range(self.n_splits - 1):
+            # 检测市场周期并自适应调整训练比例
+            fold_data = data.iloc[:max((i + 2) * fold_size, 60)]
+            market_cycle = self._detect_market_cycle(fold_data)
+            adaptive_ratio = self._adaptive_in_sample_ratio(market_cycle)
+
             # 样本内（训练）
             train_end = (i + 1) * fold_size
-            train_start = max(0, train_end - int(fold_size / (1 - self.in_sample_ratio) * self.in_sample_ratio))
+            train_start = max(0, train_end - int(fold_size / (1 - adaptive_ratio) * adaptive_ratio))
 
             # 样本外（测试）
             test_start = train_end
