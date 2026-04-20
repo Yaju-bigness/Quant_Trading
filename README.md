@@ -165,6 +165,9 @@ python main.py html --stock 300308 --output 300308_report.html
 
 # 分析股票并包含今日交易量分析
 python main.py analyze --stock 300308 --today-volume
+
+# 单只股票指定区间分析
+python3 main.py analyze --stock 688195 --start 2026-4-13 --end 2026-4-21
 ```
 
 ### 4. 市场分析
