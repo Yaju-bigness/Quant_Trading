@@ -102,7 +102,7 @@ class PerformanceAnalyzer:
             metrics.annual_return = (1 + metrics.total_return) ** (252 / days) - 1
 
         # 2. 风险指标
-        metrics.volatility = returns.std() * np.sqrt(252)
+        metrics.volatility = returns.std() * np.sqrt(252) if len(returns) >= 2 and returns.std() > 0 else 0
         metrics.max_drawdown, metrics.max_drawdown_duration = self._calculate_drawdown(equity_df['equity'])
         metrics.var_95 = self._calculate_var(returns, 0.95)
         metrics.cvar_95 = self._calculate_cvar(returns, 0.95)
@@ -305,7 +305,8 @@ class PerformanceAnalyzer:
 
         # 风险指标
         report.append("\n【风险指标】")
-        report.append(f"  年化波动率: {metrics.volatility*100:.2f}%")
+        vol_pct = metrics.volatility * 100 if not np.isnan(metrics.volatility) else 0
+        report.append(f"  年化波动率: {vol_pct:.2f}%")
         report.append(f"  最大回撤: {metrics.max_drawdown*100:.2f}%")
         report.append(f"  最大回撤持续: {metrics.max_drawdown_duration}天")
         report.append(f"  VaR(95%): {metrics.var_95*100:.2f}%")

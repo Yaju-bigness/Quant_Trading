@@ -284,8 +284,8 @@ class TechnicalAnalyzer:
 
         # ATR - 波动率
         atr = TechnicalIndicators.ATR(high, low, close)
-        analysis['atr'] = atr.iloc[-1]
-        analysis['volatility'] = atr.iloc[-1] / current_price  # 波动率
+        analysis['atr'] = atr.iloc[-1] if not pd.isna(atr.iloc[-1]) else 0
+        analysis['volatility'] = analysis['atr'] / current_price if current_price > 0 and analysis['atr'] > 0 else 0
 
         # 综合评分
         score = 0
@@ -343,8 +343,10 @@ class TechnicalAnalyzer:
         if not analysis:
             return "无法生成报告，数据为空"
 
-        # 处理可能为None的值
+        # 处理可能为None/NaN的值
         ma60_str = f"{analysis['ma']['MA60']:.2f}" if analysis['ma'].get('MA60') else 'N/A'
+        vol_str = f"{analysis['volatility']:.2%}" if analysis['volatility'] else 'N/A'
+        atr_str = f"{analysis['atr']:.2f}" if analysis['atr'] else 'N/A'
 
         report = f"""
 {'='*60}
@@ -395,8 +397,8 @@ J: {analysis['kdj']['J']:.2f}
 状态: {analysis['volume']['status']}
 
 【波动率分析】
-ATR: {analysis['atr']:.2f}
-波动率: {analysis['volatility']:.2%}
+ATR: {atr_str}
+波动率: {vol_str}
 
 {'='*60}
 综合评分: {analysis['score']}
@@ -601,9 +603,10 @@ ATR: {analysis['atr']:.2f}
                 color='black', ha='center', va='center')
 
         # 价格信息
+        vol_display = f"{analysis['volatility']:.2%}" if analysis['volatility'] else 'N/A'
         price_text = (f"最新价: {analysis['latest_price']:.2f}    "
                      f"区间涨跌: {analysis['price_change']*100:+.2f}%    "
-                     f"波动率: {analysis['volatility']:.2%}")
+                     f"波动率: {vol_display}")
         ax6.text(0.5, 0.06, price_text,
                 transform=ax6.transAxes, fontsize=10,
                 color='gray', ha='center', va='center')
@@ -764,7 +767,8 @@ class PerformanceAnalyzer:
         """计算年化波动率"""
         if len(returns) < 2:
             return 0
-        return returns.std() * np.sqrt(252)
+        vol = returns.std() * np.sqrt(252)
+        return vol if not pd.isna(vol) else 0
 
     def _max_drawdown(self, equity: pd.Series) -> float:
         """计算最大回撤"""

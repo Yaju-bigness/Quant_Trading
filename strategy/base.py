@@ -92,6 +92,10 @@ class BaseStrategy(ABC):
             return
         recent_vol = returns.tail(20).std() * np.sqrt(252)
 
+        # 波动率为NaN时跳过调整
+        if pd.isna(recent_vol):
+            return
+
         # 波动率分位判断
         if recent_vol > 0.4:  # 高波动
             vol_level = 'high'

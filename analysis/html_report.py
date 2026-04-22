@@ -203,6 +203,8 @@ class HTMLReportGenerator:
         # 波动率风险
         if 'close' in df.columns and len(df) >= 20:
             vol = df['close'].pct_change().tail(20).std() * np.sqrt(252)
+            if pd.isna(vol):
+                vol = 0
             if vol > 0.4:
                 risk_score += 25
                 risk_warnings.append(f"高波动率({vol*100:.1f}%)")
@@ -842,6 +844,314 @@ class HTMLReportGenerator:
                 logger.info(f"对比报告已保存: {output_path}")
             except Exception as e:
                 logger.error(f"保存对比报告失败: {e}")
+
+        return html
+
+    def generate_ranking_report(self, stock_list: Dict[str, str],
+                                start_date: str, end_date: str,
+                                output_path: str = None) -> str:
+        """
+        生成股票买入价值排名HTML报告
+        :param stock_list: {股票名称: 股票代码}
+        :param start_date: 开始日期
+        :param end_date: 结束日期
+        :param output_path: 保存路径
+        :return: HTML字符串
+        """
+        import json
+        from analysis.ranker import StockRanker
+
+        ranker = StockRanker()
+        results = ranker.rank_stocks(stock_list, start_date, end_date)
+
+        if not results:
+            logger.error("无法获取排名数据")
+            return ""
+
+        # 准备图表数据
+        names = [r['name'] for r in results]
+        scores = [r['buy_worthiness'] for r in results]
+        # 柱状图颜色：买入值高→红(看涨)，低→绿(看跌)
+        bar_colors = []
+        for s in scores:
+            if s >= 70:
+                bar_colors.append('#DC143C')
+            elif s >= 50:
+                bar_colors.append('#FF6347')
+            elif s >= 30:
+                bar_colors.append('#FFA500')
+            else:
+                bar_colors.append('#228B22')
+
+        # 表格行
+        table_rows = []
+        for i, r in enumerate(results, 1):
+            change_pct = r['price_change'] * 100
+            change_color = '#DC143C' if change_pct >= 0 else '#228B22'
+            change_str = f"+{change_pct:.2f}%" if change_pct >= 0 else f"{change_pct:.2f}%"
+
+            rec_colors = {
+                '强烈买入': '#DC143C', '买入': '#FF4500', '谨慎买入': '#FF6347',
+                '持有观望': '#808080', '减仓': '#32CD32', '卖出': '#228B22',
+            }
+            rec_color = rec_colors.get(r['recommendation'], '#808080')
+
+            risk_colors = {'低': '#28a745', '中': '#ffc107', '高': '#dc3545'}
+            risk_color = risk_colors.get(r['risk_level'], '#808080')
+
+            score_bg = '#ffeaea' if r['buy_worthiness'] >= 70 else \
+                       '#fff3e0' if r['buy_worthiness'] >= 50 else \
+                       '#f0f0f0'
+
+            # 维度得分小条
+            dim_labels = {
+                'dim_tech': '技术(0-20)', 'dim_volume': '量能(0-20)', 'dim_risk': '风险(0-20)',
+                'dim_news': '消息(0-15)', 'dim_market': '市场(0-15)', 'dim_global_sector': '全球/板块(0-10)',
+            }
+            dim_html = ' | '.join(
+                f"{label}: {r[k]:.0f}" for k, label in dim_labels.items()
+            )
+
+            # 消息面颜色
+            news_colors = {'积极': '#DC143C', '偏积极': '#FF6347', '中性': '#808080',
+                           '偏消极': '#32CD32', '消极': '#228B22', '无数据': '#999'}
+            news_color = news_colors.get(r.get('news_status', '无数据'), '#999')
+
+            # 板块颜色
+            sector_colors = {'强势': '#DC143C', '偏强': '#FF6347', '中性': '#808080',
+                             '偏弱': '#32CD32', '弱势': '#228B22', '无数据': '#999'}
+            sector_color = sector_colors.get(r.get('sector_status', '无数据'), '#999')
+
+            table_rows.append(f"""
+                <tr>
+                    <td style="text-align:center;font-weight:bold">{i}</td>
+                    <td style="font-weight:bold">{r['name']}</td>
+                    <td style="color:#666">{r['code']}</td>
+                    <td style="text-align:right">{r['price']:.2f}</td>
+                    <td style="text-align:right;color:{change_color}">{change_str}</td>
+                    <td style="text-align:center;font-weight:bold;background:{score_bg}">{r['buy_worthiness']:.1f}</td>
+                    <td style="text-align:center;color:{rec_color};font-weight:bold">{r['recommendation']}</td>
+                    <td style="text-align:center">{r['dim_tech']:.0f}</td>
+                    <td style="text-align:center">{r['dim_volume']:.0f}</td>
+                    <td style="text-align:center;color:{risk_color};font-weight:bold">{r['risk_level']}</td>
+                    <td style="text-align:center;color:{news_color}">{r.get('news_status', 'N/A')}</td>
+                    <td style="text-align:center">{r.get('market_sentiment', 'N/A')}</td>
+                    <td style="text-align:center;color:{sector_color}">{r.get('global_status', 'N/A')}/{r.get('sector_status', 'N/A')}</td>
+                </tr>
+                <tr class="detail-row">
+                    <td colspan="13" style="padding:5px 15px;color:#888;font-size:12px">{dim_html}</td>
+                </tr>
+            """)
+
+        html = f"""
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>股票买入价值排名</title>
+    <script src="https://cdn.jsdelivr.net/npm/echarts@5.4.3/dist/echarts.min.js"></script>
+    <style>
+        * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+        body {{
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }}
+        .container {{
+            max-width: 1400px;
+            margin: 0 auto;
+            background: #fff;
+            border-radius: 20px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            overflow: hidden;
+        }}
+        .header {{
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            color: #fff;
+            padding: 30px 40px;
+            text-align: center;
+        }}
+        .header h1 {{ font-size: 28px; margin-bottom: 10px; }}
+        .header .subtitle {{ font-size: 14px; color: #aaa; }}
+        .content {{ padding: 30px 40px; }}
+        .section {{
+            margin-bottom: 30px;
+            padding: 25px;
+            background: #f8f9fa;
+            border-radius: 15px;
+            border-left: 4px solid #667eea;
+        }}
+        .section h2 {{
+            font-size: 18px;
+            color: #333;
+            margin-bottom: 20px;
+            padding-bottom: 10px;
+            border-bottom: 2px solid #e9ecef;
+        }}
+        .chart-container {{
+            background: #fff;
+            border-radius: 15px;
+            padding: 20px;
+            margin-bottom: 20px;
+            box-shadow: 0 2px 15px rgba(0,0,0,0.08);
+        }}
+        .chart {{ width: 100%; height: 400px; }}
+        .ranking-table {{
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 14px;
+        }}
+        .ranking-table th {{
+            background: #1a1a2e;
+            color: #fff;
+            padding: 12px 10px;
+            text-align: center;
+            font-weight: bold;
+            white-space: nowrap;
+        }}
+        .ranking-table td {{
+            padding: 10px;
+            border-bottom: 1px solid #eee;
+        }}
+        .ranking-table tr:hover {{ background: #f5f7fa; }}
+        .detail-row {{ display: none; }}
+        .ranking-table tr:hover + .detail-row {{ display: table-row; }}
+        .score-legend {{
+            display: flex;
+            gap: 20px;
+            justify-content: center;
+            margin: 15px 0;
+            font-size: 13px;
+            color: #666;
+        }}
+        .score-legend span {{
+            display: flex;
+            align-items: center;
+            gap: 5px;
+        }}
+        .score-legend .dot {{
+            width: 12px;
+            height: 12px;
+            border-radius: 3px;
+            display: inline-block;
+        }}
+        .footer {{
+            text-align: center;
+            padding: 20px;
+            background: #f8f9fa;
+            color: #666;
+            font-size: 12px;
+        }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>股票买入价值排名</h1>
+            <div class="subtitle">分析区间: {start_date} ~ {end_date} | 生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</div>
+        </div>
+
+        <div class="content">
+            <!-- 买入价值柱状图 -->
+            <div class="chart-container">
+                <div id="chart-score" class="chart"></div>
+            </div>
+
+            <div class="score-legend">
+                <span><span class="dot" style="background:#DC143C"></span> 买入值 >= 70 (强烈推荐)</span>
+                <span><span class="dot" style="background:#FF6347"></span> 买入值 50-70 (值得关注)</span>
+                <span><span class="dot" style="background:#FFA500"></span> 买入值 30-50 (谨慎观望)</span>
+                <span><span class="dot" style="background:#228B22"></span> 买入值 < 30 (建议回避)</span>
+            </div>
+
+            <!-- 排名表格 -->
+            <div class="section">
+                <h2>【详细排名】</h2>
+                <table class="ranking-table">
+                    <tr>
+                        <th>排名</th>
+                        <th>股票名称</th>
+                        <th>代码</th>
+                        <th>最新价</th>
+                        <th>涨跌幅</th>
+                        <th>买入值</th>
+                        <th>建议</th>
+                        <th>技术</th>
+                        <th>量能</th>
+                        <th>风险</th>
+                        <th>消息面</th>
+                        <th>市场</th>
+                        <th>全球/板块</th>
+                    </tr>
+                    {''.join(table_rows)}
+                </table>
+            </div>
+
+            <!-- 评分说明 -->
+            <div class="section">
+                <h2>【评分说明】</h2>
+                <div style="color:#666;line-height:1.8">
+                    <p><b>买入价值 = 技术面(0-20) + 量能(0-20) + 风险(0-20) + 消息面(0-15) + 市场情绪(0-15) + 全球/板块联动(0-10)</b></p>
+                    <p style="margin-top:5px">总分0-100，50为中性临界值</p>
+                    <ul style="margin-left:20px;margin-top:10px">
+                        <li><b>技术面(0-20)</b>: 趋势方向(0-6) + 均线排列(0-5) + 位置(0-4) + 支撑压力(0-3) + 主升浪(0-2)</li>
+                        <li><b>量能(0-20)</b>: 放量健康度(0-8) + 资金流入(0-7) + 换手率合理性(0-5)</li>
+                        <li><b>风险(0-20)</b>: 涨幅透支 + 筹码结构 + 波动级别（风险越低分越高，从20分扣减）</li>
+                        <li><b>消息面(0-15)</b>: 业绩/行业催化(0-7) + 资金流向(0-5) + 政策/订单(0-3)</li>
+                        <li><b>市场情绪(0-15)</b>: 板块强弱(0-6) + 资金偏好(0-5) + 连板效应(0-4)</li>
+                        <li><b>全球/板块联动(0-10)</b>: 美股映射(0-4) + 行业周期(0-3) + 海外涨价(0-3)</li>
+                    </ul>
+                    <p style="margin-top:10px"><b>建议等级</b>: 强烈买入(≥80) / 买入(≥65) / 谨慎买入(≥50) / 持有观望(≥35) / 减仓(≥20) / 卖出(&lt;20)</p>
+                </div>
+            </div>
+        </div>
+
+        <div class="footer">
+            本报告仅供参考，不构成投资建议。投资有风险，入市需谨慎。
+        </div>
+    </div>
+
+    <script>
+        const chartScore = echarts.init(document.getElementById('chart-score'));
+        chartScore.setOption({{
+            title: {{ text: '买入价值评分', left: 'center' }},
+            tooltip: {{ trigger: 'axis', axisPointer: {{ type: 'shadow' }} }},
+            grid: {{ left: '15%', right: '10%', bottom: '10%', top: '15%' }},
+            xAxis: {{ type: 'value', min: 0, max: 100, name: '买入值' }},
+            yAxis: {{
+                type: 'category',
+                data: {json.dumps(names, ensure_ascii=False)},
+                axisLabel: {{ fontSize: 13 }}
+            }},
+            series: [{{
+                type: 'bar',
+                data: {json.dumps([{{'value': s, 'itemStyle': {{'color': c}}}} for s, c in zip(scores, bar_colors)])},
+                barWidth: '60%',
+                label: {{
+                    show: true,
+                    position: 'right',
+                    formatter: '{{c}}',
+                    fontSize: 14,
+                    fontWeight: 'bold'
+                }}
+            }}]
+        }});
+
+        window.addEventListener('resize', function() {{ chartScore.resize(); }});
+    </script>
+</body>
+</html>
+        """
+
+        if output_path:
+            try:
+                with open(output_path, 'w', encoding='utf-8') as f:
+                    f.write(html)
+                logger.info(f"排名报告已保存: {output_path}")
+            except Exception as e:
+                logger.error(f"保存排名报告失败: {e}")
 
         return html
 

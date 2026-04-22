@@ -601,7 +601,7 @@ class BacktestEngine:
           最大回撤: {report['max_drawdown']*100:.2f}%
 
         风险指标:
-          年化波动率: {report.get('volatility', 0)*100:.2f}%
+          年化波动率: {(report.get('volatility') or 0)*100:.2f}%
           VaR(95%): {report.get('var_95', 0)*100:.2f}%
 
         交易统计:

@@ -1,6 +1,6 @@
 """
 数据获取模块
-支持：AKShare免费数据 + 同花顺/通达信API
+支持：直接HTTP数据源 + AKShare免费数据 + 同花顺/通达信API
 """
 import akshare as ak
 import pandas as pd
@@ -12,6 +12,8 @@ import requests
 import json
 import signal
 import time
+import io
+import re
 
 try:
     from pytdx.hq import TdxHq_API
@@ -29,6 +31,12 @@ class DataSource:
         self.tdx_api = None
         # 数据源成功率统计 {源名称: {success: int, fail: int}}
         self._source_stats: Dict[str, Dict[str, int]] = {}
+        # HTTP会话（用于直接HTTP数据源）
+        self._session = requests.Session()
+        self._session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Referer': 'https://finance.sina.com.cn',
+        })
         if self.use_tdx:
             self._init_tdx()
 
@@ -96,6 +104,22 @@ class DataSource:
         else:
             return {'code': stock_code, 'market': 0}  # 深圳
 
+    @staticmethod
+    def _market_prefix_http(code: str) -> str:
+        """返回HTTP接口用市场前缀 sh/sz"""
+        return 'sh' if code.startswith('6') else 'sz'
+
+    @staticmethod
+    def _market_id_eastmoney(code: str) -> str:
+        """返回东方财富HTTP接口用市场ID: 1.600183 / 0.300308"""
+        market = '1' if code.startswith('6') else '0'
+        return f"{market}.{code}"
+
+    @staticmethod
+    def _market_prefix_netease(code: str) -> str:
+        """返回网易HTTP接口用前缀: 0=沪 1=深 (与常规相反)"""
+        return f"0{code}" if code.startswith('6') else f"1{code}"
+
     # ==================== 行情数据 ====================
 
     def get_daily_kline(self, stock_code: str, start_date: str,
@@ -120,13 +144,19 @@ class DataSource:
                           end_date: str) -> pd.DataFrame:
         """使用AKShare获取日K线（多数据源备用，带超时和成功率统计）"""
 
-        # 定义所有数据源及获取方法
+        # 定义所有数据源及获取方法（直接HTTP源优先，akshare备用）
         source_methods = [
+            # 直接HTTP源（无反爬风险，优先尝试）
+            ('东方财富(HTTP)', self._source_eastmoney_http),
+            ('腾讯(HTTP)', self._source_tencent_http),
+            ('新浪(HTTP)', self._source_sina_http),
+            ('网易(HTTP)', self._source_netease_http),
+            # AKShare源（备用）
             ('东方财富(hist)', self._source_eastmoney_hist),
             ('东方财富(min_em)', self._source_eastmoney_min),
-            ('新浪', self._source_sina),
-            ('腾讯', self._source_tencent),
-            ('网易', self._source_netease),
+            ('新浪(akshare)', self._source_sina),
+            ('腾讯(akshare)', self._source_tencent),
+            ('网易(akshare)', self._source_netease),
             ('同花顺', self._source_ths),
             ('东方财富(spot_em)', self._source_eastmoney_spot),
             ('Yahoo Finance', self._source_yahoo),
@@ -158,7 +188,179 @@ class DataSource:
         logger.error(f"所有数据源({len(source_methods)}个)均获取失败")
         return pd.DataFrame()
 
-    # ==================== 各数据源独立方法 ====================
+    # ==================== 直接HTTP数据源（无反爬） ====================
+
+    def _source_eastmoney_http(self, stock_code, start_date, end_date):
+        """东方财富直接HTTP日K线（push2his.eastmoney.com）"""
+        secid = self._market_id_eastmoney(stock_code)
+        beg = start_date.replace('-', '')
+        end = end_date.replace('-', '')
+        url = (
+            f"https://push2his.eastmoney.com/api/qt/stock/kline/get"
+            f"?secid={secid}&fields1=f1,f2,f3,f4,f5,f6"
+            f"&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61"
+            f"&klt=101&fqt=1&beg={beg}&end={end}"
+        )
+        resp = self._session.get(url, timeout=8)
+        data = resp.json()
+        if not data or 'data' not in data or data['data'] is None:
+            return pd.DataFrame()
+        klines = data['data'].get('klines', [])
+        if not klines:
+            return pd.DataFrame()
+        rows = []
+        for line in klines:
+            parts = line.split(',')
+            if len(parts) >= 7:
+                rows.append({
+                    'date': parts[0],
+                    'open': float(parts[1]),
+                    'close': float(parts[2]),
+                    'high': float(parts[3]),
+                    'low': float(parts[4]),
+                    'volume': float(parts[5]),
+                    'amount': float(parts[6]) if len(parts) > 6 else 0,
+                })
+        if not rows:
+            return pd.DataFrame()
+        df = pd.DataFrame(rows)
+        df['date'] = pd.to_datetime(df['date'])
+        logger.debug("数据源: 东方财富(HTTP)")
+        return df
+
+    def _source_tencent_http(self, stock_code, start_date, end_date):
+        """腾讯直接HTTP日K线（web.ifzq.gtimg.cn）"""
+        prefix = self._market_prefix_http(stock_code)
+        # 腾讯API日期需要YYYY-MM-DD格式
+        url = (
+            f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
+            f"?param={prefix}{stock_code},day,{start_date},{end_date},500,qfq"
+        )
+        resp = self._session.get(url, timeout=8)
+        data = resp.json()
+        if not data or data.get('code') != 0 or 'data' not in data:
+            return pd.DataFrame()
+        # data结构: {prefix+code: {qfqday: [[date,open,close,high,low,vol], ...], ...}}
+        stock_data_dict = data['data']
+        if not isinstance(stock_data_dict, dict) or not stock_data_dict:
+            return pd.DataFrame()
+        # 取第一个key（通常是 prefix+code）
+        stock_key = list(stock_data_dict.keys())[0]
+        stock_data = stock_data_dict[stock_key]
+        klines = stock_data.get('qfqday') or stock_data.get('day', [])
+        if not klines:
+            return pd.DataFrame()
+        rows = []
+        for item in klines:
+            if len(item) >= 6:
+                rows.append({
+                    'date': item[0],
+                    'open': float(item[1]),
+                    'close': float(item[2]),
+                    'high': float(item[3]),
+                    'low': float(item[4]),
+                    'volume': float(item[5]),
+                })
+        if not rows:
+            return pd.DataFrame()
+        df = pd.DataFrame(rows)
+        df['date'] = pd.to_datetime(df['date'])
+        logger.debug("数据源: 腾讯(HTTP)")
+        return df
+
+    def _source_sina_http(self, stock_code, start_date, end_date):
+        """新浪直接HTTP日K线（money.finance.sina.com.cn）"""
+        prefix = self._market_prefix_http(stock_code)
+        url = (
+            f"https://money.finance.sina.com.cn/quotes_service/api/json_v2.php"
+            f"/CN_MarketData.getKLineData?symbol={prefix}{stock_code}"
+            f"&scale=240&ma=no&datalen=800"
+        )
+        headers = {
+            'Referer': 'https://finance.sina.com.cn',
+            'User-Agent': self._session.headers['User-Agent'],
+        }
+        resp = requests.get(url, headers=headers, timeout=8)
+        # 新浪返回JSON数组
+        raw = resp.text.strip()
+        if not raw or raw.startswith('<') or 'error' in raw.lower():
+            return pd.DataFrame()
+        try:
+            items = json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            return pd.DataFrame()
+        if not isinstance(items, list) or not items:
+            return pd.DataFrame()
+        rows = []
+        for item in items:
+            try:
+                rows.append({
+                    'date': item.get('day', ''),
+                    'open': float(item.get('open', 0)),
+                    'high': float(item.get('high', 0)),
+                    'low': float(item.get('low', 0)),
+                    'close': float(item.get('close', 0)),
+                    'volume': float(item.get('volume', 0)),
+                })
+            except (ValueError, TypeError):
+                continue
+        if not rows:
+            return pd.DataFrame()
+        df = pd.DataFrame(rows)
+        df['date'] = pd.to_datetime(df['date'])
+        start = pd.to_datetime(start_date)
+        end = pd.to_datetime(end_date)
+        df = df[(df['date'] >= start) & (df['date'] <= end)]
+        if not df.empty:
+            logger.debug("数据源: 新浪(HTTP)")
+        return df
+
+    def _source_netease_http(self, stock_code, start_date, end_date):
+        """网易直接HTTP日K线（quotes.money.163.com CSV）"""
+        prefix = self._market_prefix_netease(stock_code)
+        start = start_date.replace('-', '')
+        end = end_date.replace('-', '')
+        url = (
+            f"http://quotes.money.163.com/service/chddata.html"
+            f"?code={prefix}&start={start}&end={end}"
+            f"&fields=TOPEN;HIGH;LOW;TCLOSE;VOTURNOVER;ATURNOVER"
+        )
+        resp = self._session.get(url, timeout=8)
+        if not resp.text or 'None' in resp.text[:50]:
+            return pd.DataFrame()
+        try:
+            df = pd.read_csv(io.StringIO(resp.text), encoding='gbk')
+        except Exception:
+            try:
+                df = pd.read_csv(io.StringIO(resp.text))
+            except Exception:
+                return pd.DataFrame()
+        if df.empty:
+            return pd.DataFrame()
+        df = df.rename(columns={
+            '日期': 'date', '开盘价': 'open', '最高价': 'high',
+            '最低价': 'low', '收盘价': 'close', '成交量': 'volume', '成交额': 'amount',
+        })
+        # 网易CSV可能用英文列名
+        col_map = {'TOPEN': 'open', 'HIGH': 'high', 'LOW': 'low',
+                    'TCLOSE': 'close', 'VOTURNOVER': 'volume', 'ATURNOVER': 'amount'}
+        for old, new in col_map.items():
+            if old in df.columns and new not in df.columns:
+                df = df.rename(columns={old: new})
+        # 过滤无效行
+        required = ['date', 'open', 'close', 'high', 'low', 'volume']
+        for col in required:
+            if col not in df.columns:
+                return pd.DataFrame()
+        df = df.dropna(subset=['close'])
+        for col in ['open', 'high', 'low', 'close', 'volume']:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+        df = df.dropna(subset=['close'])
+        df['date'] = pd.to_datetime(df['date'])
+        logger.debug("数据源: 网易(HTTP)")
+        return df
+
+    # ==================== AKShare数据源 ====================
 
     def _source_eastmoney_hist(self, stock_code, start_date, end_date):
         """东方财富日K线"""
@@ -343,9 +545,27 @@ class DataSource:
             return pd.DataFrame()
 
     def _get_realtime_akshare(self, stock_codes: List[str]) -> pd.DataFrame:
-        """使用AKShare获取实时行情（多数据源备用）"""
+        """获取实时行情（直接HTTP源优先，akshare备用）"""
 
-        # 方法1: 东方财富实时行情
+        # 方法1: 腾讯HTTP实时行情（批量，速度快）
+        try:
+            df = self._get_realtime_tencent_http(stock_codes)
+            if df is not None and not df.empty:
+                logger.debug("实时行情数据源: 腾讯(HTTP)")
+                return df
+        except Exception as e:
+            logger.warning(f"[实时备用1]腾讯HTTP源失败: {e}")
+
+        # 方法2: 新浪HTTP实时行情（批量）
+        try:
+            df = self._get_realtime_sina_http(stock_codes)
+            if df is not None and not df.empty:
+                logger.debug("实时行情数据源: 新浪(HTTP)")
+                return df
+        except Exception as e:
+            logger.warning(f"[实时备用2]新浪HTTP源失败: {e}")
+
+        # 方法3: 东方财富实时行情(akshare)
         try:
             df = ak.stock_zh_a_spot_em()
             if df is not None and not df.empty:
@@ -366,9 +586,9 @@ class DataSource:
                 logger.debug("实时行情数据源: 东方财富(spot_em)")
                 return df
         except Exception as e:
-            logger.warning(f"[实时备用1]东方财富源失败: {e}")
+            logger.warning(f"[实时备用3]东方财富源失败: {e}")
 
-        # 方法2: 新浪实时行情
+        # 方法4: 新浪实时行情(akshare)
         try:
             result_df = pd.DataFrame()
             for code in stock_codes:
@@ -392,12 +612,12 @@ class DataSource:
                     '今开': 'open',
                     '昨收': 'pre_close'
                 })
-                logger.debug("实时行情数据源: 新浪(sina)")
+                logger.debug("实时行情数据源: 新浪(akshare)")
                 return result_df
         except Exception as e:
-            logger.warning(f"[实时备用2]新浪源失败: {e}")
+            logger.warning(f"[实时备用4]新浪akshare源失败: {e}")
 
-        # 方法3: 腾讯实时行情
+        # 方法5: 腾讯实时行情(akshare)
         try:
             result_df = pd.DataFrame()
             for code in stock_codes:
@@ -416,12 +636,12 @@ class DataSource:
                     '最低': 'low',
                     '成交量': 'volume'
                 })
-                logger.debug("实时行情数据源: 腾讯(tx)")
+                logger.debug("实时行情数据源: 腾讯(akshare)")
                 return result_df
         except Exception as e:
-            logger.warning(f"[实时备用3]腾讯源失败: {e}")
+            logger.warning(f"[实时备用5]腾讯akshare源失败: {e}")
 
-        # 方法4: 网易实时行情
+        # 方法6: 网易实时行情(akshare)
         try:
             result_df = pd.DataFrame()
             for code in stock_codes:
@@ -473,8 +693,126 @@ class DataSource:
         except Exception as e:
             logger.warning(f"[实时备用5]Yahoo Finance源失败: {e}")
 
-        logger.error(f"所有实时行情数据源(5个)均获取失败")
+        logger.error(f"所有实时行情数据源(8个)均获取失败")
         return pd.DataFrame()
+
+    # ==================== 直接HTTP实时行情 ====================
+
+    def _get_realtime_tencent_http(self, stock_codes: List[str]) -> pd.DataFrame:
+        """腾讯HTTP实时行情（qt.gtimg.cn，支持批量查询）"""
+        codes_str = ','.join(
+            f"{self._market_prefix_http(c)}{c}" for c in stock_codes
+        )
+        url = f"https://qt.gtimg.cn/q={codes_str}"
+        resp = self._session.get(url, timeout=8)
+        text = resp.text.strip()
+        if not text:
+            return pd.DataFrame()
+
+        rows = []
+        for chunk in text.split(';'):
+            chunk = chunk.strip()
+            if not chunk or '=' not in chunk:
+                continue
+            try:
+                # 格式: v_sh600183="1~名称~代码~当前价~昨收~今开~...~成交量~成交额~...~最高~最低~..."
+                value_part = chunk.split('=', 1)[1].strip('"').strip()
+                if not value_part:
+                    continue
+                fields = value_part.split('~')
+                if len(fields) < 48:
+                    continue
+                name = fields[1]
+                code = fields[2]
+                price = float(fields[3])
+                pre_close = float(fields[4])
+                open_price = float(fields[5])
+                volume = float(fields[6]) if fields[6] else 0
+                # fields[7] = 外盘, fields[8] = 内盘
+                high = float(fields[33]) if fields[33] else 0
+                low = float(fields[34]) if fields[34] else 0
+                amount = float(fields[37]) if len(fields) > 37 and fields[37] else 0
+                change = price - pre_close if pre_close > 0 else 0
+                pct_change = (change / pre_close * 100) if pre_close > 0 else 0
+
+                rows.append({
+                    'code': code,
+                    'name': name,
+                    'price': price,
+                    'pct_change': pct_change,
+                    'change': change,
+                    'volume': volume,
+                    'amount': amount,
+                    'high': high,
+                    'low': low,
+                    'open': open_price,
+                    'pre_close': pre_close,
+                })
+            except (ValueError, IndexError):
+                continue
+
+        return pd.DataFrame(rows) if rows else pd.DataFrame()
+
+    def _get_realtime_sina_http(self, stock_codes: List[str]) -> pd.DataFrame:
+        """新浪HTTP实时行情（hq.sinajs.cn，支持批量查询）"""
+        codes_str = ','.join(
+            f"{self._market_prefix_http(c)}{c}" for c in stock_codes
+        )
+        url = f"https://hq.sinajs.cn/list={codes_str}"
+        headers = {
+            'Referer': 'https://finance.sina.com.cn',
+            'User-Agent': self._session.headers['User-Agent'],
+        }
+        resp = requests.get(url, headers=headers, timeout=8)
+        text = resp.text.strip()
+        if not text:
+            return pd.DataFrame()
+
+        rows = []
+        for line in text.split('\n'):
+            line = line.strip()
+            if not line or '=' not in line:
+                continue
+            try:
+                # 格式: var hq_str_sh600183="名称,今开,昨收,当前价,最高,最低,买一,卖一,成交量,成交额,..."
+                var_name, value = line.split('=', 1)
+                # 从变量名提取代码
+                match = re.search(r'(\d{6})', var_name)
+                code = match.group(1) if match else ''
+                value = value.strip('";').strip()
+                if not value:
+                    continue
+                fields = value.split(',')
+                if len(fields) < 32:
+                    continue
+                name = fields[0]
+                open_price = float(fields[1]) if fields[1] else 0
+                pre_close = float(fields[2]) if fields[2] else 0
+                price = float(fields[3]) if fields[3] else 0
+                high = float(fields[4]) if fields[4] else 0
+                low = float(fields[5]) if fields[5] else 0
+                volume = float(fields[8]) if fields[8] else 0
+                amount = float(fields[9]) if fields[9] else 0
+                change = price - pre_close if pre_close > 0 else 0
+                pct_change = (change / pre_close * 100) if pre_close > 0 else 0
+
+                rows.append({
+                    'code': code,
+                    'name': name,
+                    'price': price,
+                    'pct_change': pct_change,
+                    'change': change,
+                    'volume': volume,
+                    'amount': amount,
+                    'high': high,
+                    'low': low,
+                    'open': open_price,
+                    'pre_close': pre_close,
+                })
+            except (ValueError, IndexError):
+                continue
+
+        return pd.DataFrame(rows) if rows else pd.DataFrame()
 
     def _get_realtime_tdx(self, stock_codes: List[str]) -> pd.DataFrame:
         """使用通达信获取实时行情"""
@@ -815,6 +1153,8 @@ class DataSource:
         if self.tdx_api:
             self.tdx_api.disconnect()
             logger.info("通达信API连接已关闭")
+        if self._session:
+            self._session.close()
 
 
 # 便捷函数

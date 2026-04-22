@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 from typing import Dict
 from loguru import logger
 
-from config.config import STOCKS, TRADING_CONFIG, BACKTEST_CONFIG, RISK_CONFIG
+from config.config import STOCKS, SECTOR_STOCKS, TRADING_CONFIG, BACKTEST_CONFIG, RISK_CONFIG
 from data.data_source import DataSource
 from data.data_manager import DataManager
 from strategy.technical import (
@@ -24,6 +24,7 @@ from strategy.intraday import (
 from backtest.engine import BacktestEngine
 from trade.executor import PaperTrader, LiveTradingEngine, create_trader
 from analysis.analyzer import TechnicalAnalyzer, ReportGenerator, MarketAnalyzer
+from analysis.ranker import StockRanker
 from analysis.html_report import HTMLReportGenerator
 from analysis.performance import PerformanceAnalyzer
 from risk.manager import RiskManager, RiskConfig
@@ -173,11 +174,17 @@ def run_analysis(args):
                 save_path=args.output
             )
     else:
-        # 分析所有关注的股票 - 只打印报告
+        # 分析所有关注的股票 - 打印报告 + 综合排名
         for name, code in STOCKS.items():
             logger.info(f"分析 {name} ({code})")
             analysis = analyzer.analyze_stock(code, start_date, end_date)
             print(analyzer.generate_report(analysis))
+
+        # 综合排名
+        ranker = StockRanker()
+        results = ranker.rank_stocks(STOCKS, start_date, end_date)
+        if results:
+            print(ranker.format_ranking_table(results))
 
 
 def run_market_analysis(args):
@@ -315,6 +322,66 @@ def print_sector_report(sector_result: Dict):
     print(f"\n板块情绪: {sector_result.get('sentiment', '未知')}")
     print(f"情绪得分: {sector_result.get('score', 0)}")
     print(f"操作建议: {sector_result.get('suggestion', '')}")
+
+
+def run_rank(args):
+    """运行股票买入价值排名"""
+    logger.info("开始股票排名分析...")
+
+    ranker = StockRanker()
+
+    # 确定股票列表
+    if args.sector:
+        # 按板块选择股票
+        sector_name = args.sector
+        if sector_name in SECTOR_STOCKS:
+            stock_list = SECTOR_STOCKS[sector_name]
+            logger.info(f"选择板块: {sector_name} ({len(stock_list)} 只股票)")
+        else:
+            # 模糊匹配板块名
+            matched = {k: v for k, v in SECTOR_STOCKS.items() if sector_name.upper() in k.upper()}
+            if matched:
+                # 合并所有匹配板块
+                stock_list = {}
+                for k, v in matched.items():
+                    stock_list.update(v)
+                    logger.info(f"匹配板块: {k} ({len(v)} 只股票)")
+            else:
+                print(f"未找到板块 '{sector_name}'，可用板块: {', '.join(SECTOR_STOCKS.keys())}")
+                return
+    elif args.stocks:
+        codes = [c.strip() for c in args.stocks.split(',')]
+        code_to_name = {v: k for k, v in STOCKS.items()}
+        # 也从SECTOR_STOCKS中查找名称
+        for sector_stocks in SECTOR_STOCKS.values():
+            for n, c in sector_stocks.items():
+                if c not in code_to_name:
+                    code_to_name[c] = n
+        stock_list = {code_to_name.get(c, c): c for c in codes}
+    else:
+        stock_list = STOCKS
+
+    # 日期范围
+    end_date = args.end or datetime.now().strftime('%Y-%m-%d')
+    start_date = args.start or (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')
+
+    # 排名
+    results = ranker.rank_stocks(stock_list, start_date, end_date)
+
+    if not results:
+        print("无法获取排名数据")
+        return
+
+    # 生成HTML报告
+    if args.html:
+        html_generator = HTMLReportGenerator()
+        html_path = args.html
+        html_generator.generate_ranking_report(stock_list, start_date, end_date, html_path)
+        logger.info(f"HTML排名报告已生成: {html_path}")
+
+    # 打印文本表格
+    top_n = args.top or len(results)
+    print(ranker.format_ranking_table(results, top_n=top_n))
 
 
 def run_html_report(args):
@@ -598,6 +665,16 @@ def main():
     market_parser.add_argument('--all', '-a', action='store_true', help='执行全部市场分析')
     market_parser.add_argument('--top', type=int, default=10, help='显示前N个热门/弱势板块')
 
+    # 排名命令
+    rank_parser = subparsers.add_parser('rank', help='股票买入价值排名')
+    rank_parser.add_argument('--stocks', '-s', help='股票代码列表，逗号分隔 (如 300308,301308)')
+    rank_parser.add_argument('--sector', help='按板块排名 (PCB/存储/CPO)')
+    rank_parser.add_argument('--top', '-t', type=int, default=None, help='显示前N名')
+    rank_parser.add_argument('--html', nargs='?', const='ranking.html', default=None,
+                            help='生成HTML排名报告（可指定文件名）')
+    rank_parser.add_argument('--start', help='开始日期 YYYY-MM-DD')
+    rank_parser.add_argument('--end', help='结束日期 YYYY-MM-DD')
+
     args = parser.parse_args()
 
     # 执行对应命令
@@ -609,6 +686,8 @@ def main():
         run_analysis(args)
     elif args.command == 'market':
         run_market_analysis(args)
+    elif args.command == 'rank':
+        run_rank(args)
     elif args.command == 'html':
         run_html_report(args)
     elif args.command == 'report':
